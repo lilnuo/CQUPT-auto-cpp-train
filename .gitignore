@@ -1,0 +1,20 @@
+# 密钥（含 ARK_API_KEY，绝不提交）
+.env
+
+# 浏览器持久化登录态（Cookie）
+.chrome-profile/
+.chrome-profile-*/
+
+# 调试 / 运行产物
+page.html
+progap.html
+captcha.png
+login.png
+*.exe
+*.dll
+
+# 编辑器 / IDE 缓存
+.workbuddy/
+.vscode/
+.idea/
+.codeartsdoer/

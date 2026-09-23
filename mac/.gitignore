@@ -1,0 +1,18 @@
+# 密钥（AI API Key，勿提交）
+.env
+
+# 浏览器持久化登录态（含 Cookie，勿提交）
+.chrome-profile/
+.chrome-profile-*/
+
+# 调试产物
+page.html
+captcha.png
+login.png
+
+# 本地工作数据
+.workbuddy/
+.vscode/
+
+# 程序题调试产物
+progap.html
