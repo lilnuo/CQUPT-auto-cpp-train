@@ -1,6 +1,9 @@
 # 重庆邮电大学程序设计平台自动刷题脚本（Windows 11 + Chrome 版）
 
-> **版本：v1.1.0（2026-09-23）** ｜ **平台：Windows 11** ｜ 更新日志见根目录 [CHANGELOG.md](../CHANGELOG.md)
+> **版本：v1.1.1（2026-09-23）** ｜ **平台：Windows 11** ｜ 更新日志见根目录 [CHANGELOG.md](../CHANGELOG.md)
+
+> ⚠️ **仅限个人学习交流，严禁用于任何盈利目的**；使用风险自负（详见根目录 [README](../README.md) 的免责声明）。
+> ⭐ 觉得好用的话，欢迎给仓库点个 **Star**。
 
 > macOS 版在另一个文件夹，这份是**专门适配 Windows 11 + Google Chrome** 的版本。
 
