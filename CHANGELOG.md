@@ -58,13 +58,13 @@
 
 ### 测试
 
-- 测试文件从 3 个增至 **6 个，86 个测试函数 / 148 个用例，全部通过**（v1.2.0 为 99 个用例）：
-  - 新增 `server/store_test.go`（36 个）：并发抢任务恰好一次、`EXPLAIN` 校验抢任务确实走 `idx_claim` 且无 filesort、重试退避、锁归属校验、`RecoverStale` 回收、`FailExhausted` 截断、`TouchLock` 丢锁识别、加密往返、配置校验、模板转义、中间件 504 兜底等。
+- 测试文件从 3 个增至 **6 个，89 个测试函数 / 151 个用例，全部通过**（v1.2.0 为 99 个用例）：
+  - 新增 `server/store_test.go`（39 个）：并发抢任务恰好一次、`EXPLAIN` 校验抢任务确实走 `idx_claim` 且无 filesort、重试退避、锁归属校验、`RecoverStale` 回收、`FailExhausted` 截断、`TouchLock` 丢锁识别、同毫秒续租回归、配置文件读取的三种情形、加密往返、配置校验、模板转义、中间件 504 兜底等。
   - 新增 `train/preflight_test.go`（10 个）：端口空闲 / CDP 端点 / 普通监听者三种形态，死锁不误报、活锁能识别、闸门放行与拦截。
   - `main_test.go` 的 JS/判题用例迁入 `train/train_test.go` 并扩充。
 - **测试数据库隔离**：DB 测试默认跳过，设 `CQUPT_TEST_DSN` 才跑；每个测试用独有学号前缀，只清自己那几行，不清空整张表。
 - **新增回归用例 `TestTouchLockSurvivesSameMillisecondRenewal`**：用会话级 `SET timestamp` 把 `NOW(3)` 钉死，**确定性地**复现同毫秒续租（回退修复后该用例必失败，已验证）。
-- 验证：`go build ./...` / `go vet ./...` 干净，**148 PASS / 0 FAIL**，macOS / Windows(PE32+) / Linux(ELF) 三平台交叉编译均通过。
+- 验证：`go build ./...` / `go vet ./...` 干净，**151 PASS / 0 FAIL**，macOS / Windows(PE32+) / Linux(ELF) 三平台交叉编译均通过。
 
 ### 其它
 
