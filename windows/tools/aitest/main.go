@@ -5,7 +5,7 @@ import (
 	"log"
 	"os"
 
-	"main/ai"
+	"cqupt/ai"
 )
 
 func main() {

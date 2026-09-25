@@ -3,15 +3,15 @@ package main
 import (
 	"bufio"
 	"context"
+	"cqupt/ai"
+	"cqupt/config"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"log"
-	"main/ai"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -25,15 +25,39 @@ var stdin = bufio.NewReader(os.Stdin)
 
 func main() {
 	dump := flag.Bool("dump", false, "进入做题页后把页面 HTML 保存到 page.html，用于调试选择器")
+	logJSON := flag.Bool("log-json", false, "以 JSON 格式输出日志（也可用环境变量 LOG_FORMAT=json）")
+	promptsInit := flag.Bool("prompts-init", false, "生成 prompts.example.json 模板后退出，便于外部覆盖 Prompt")
 	flag.Parse()
+
+	// 配置集中加载（含 .env）：必须在任何 os.Getenv 之前完成
+	config.Load()
+	if *logJSON {
+		config.C.LogFormat = "json"
+	}
+	config.C.Dump = *dump
+	config.C.Mode = *modeFlag
+	setupLogger()
+
+	if *promptsInit {
+		if err := writePromptTemplate(); err != nil {
+			slog.Error("生成 Prompt 模板失败", "err", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	// Prompt 的加载与模型初始化解耦：dump 模式不调模型，但仍可能有流程用到 Prompt
+	ai.InitPrompts(config.C.PromptsFile)
 
 	if *dump {
 		// dump 只抓取页面结构、不需要调用大模型，因此跳过 AI 初始化
 		// （这样即使 .env 没填 ARK_API_KEY 也能跑 dump）
-		log.Println("[dump 模式] 跳过 AI 初始化，无需填写 ARK_API_KEY")
+		slog.Info("[dump 模式] 跳过 AI 初始化，无需填写 ARK_API_KEY")
 	} else {
 		if err := ai.InitAI(); err != nil {
-			log.Fatalf("ai初始化失败: %v（请检查 .env 中的 ARK_API_KEY 与 ARK_MODEL_ID）", err)
+			slog.Error("AI 初始化失败", "err", err,
+				"hint", "请检查 .env 中的 ARK_API_KEY 与 ARK_MODEL_ID")
+			os.Exit(1)
 		}
 	}
 
@@ -45,10 +69,11 @@ func main() {
 	numStr := readLine()
 	num, err := strconv.Atoi(strings.TrimSpace(numStr))
 	if err != nil || num <= 0 {
-		log.Fatalf("题目数量必须是一个正整数，你输入的是 %q", numStr)
+		slog.Error("题目数量必须是一个正整数", "输入", numStr)
+		os.Exit(1)
 	}
 
-	// 新增模式分流（见 progap.go）：默认 quiz 走原有整页刷题逻辑，行为不变；
+	// 模式分流（见 progap.go）：默认 quiz 走整页刷题逻辑，行为不变；
 	// -mode=progap / progapdump 才进入程序片段编程题流程。
 	var total int
 	if *modeFlag == "progap" || *modeFlag == "progapdump" {
@@ -57,9 +82,47 @@ func main() {
 		total, err = runTrainer(username, password, num, *dump)
 	}
 	if err != nil {
-		log.Fatalf("刷题过程出错: %v", err)
+		slog.Error("刷题过程出错", "err", err)
+		os.Exit(1)
 	}
 	fmt.Printf("最终得分为 %d 分\n", total)
+}
+
+// setupLogger 按配置初始化 slog。
+// 文本格式下把时间压成 HH:MM:SS，避免默认的完整时间戳把日志挤得很长。
+func setupLogger() {
+	opts := &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+		ReplaceAttr: func(_ []string, a slog.Attr) slog.Attr {
+			if a.Key == slog.TimeKey {
+				if t, ok := a.Value.Any().(time.Time); ok {
+					a.Value = slog.StringValue(t.Format("15:04:05"))
+				}
+			}
+			return a
+		},
+	}
+	var h slog.Handler
+	if config.C.IsJSONLog() {
+		h = slog.NewJSONHandler(os.Stdout, opts)
+	} else {
+		h = slog.NewTextHandler(os.Stdout, opts)
+	}
+	slog.SetDefault(slog.New(h))
+}
+
+// writePromptTemplate 生成一份可编辑的 Prompt 模板文件
+func writePromptTemplate() error {
+	b, err := ai.DumpPromptTemplate()
+	if err != nil {
+		return err
+	}
+	const out = "prompts.example.json"
+	if err := os.WriteFile(out, b, 0644); err != nil {
+		return err
+	}
+	fmt.Printf("已生成 %s，复制为 %s 并按需修改即可覆盖内置 Prompt\n", out, config.DefaultPromptsFile)
+	return nil
 }
 
 // readLine 读取一行并去除首尾空白
@@ -75,9 +138,9 @@ func readLine() string {
 // （这就是之前一切"白屏/39 字节空壳"的根因）。验证过的可行流程是：
 // 原生启动 Chrome（不附加任何自动化连接）→ 等 WAF 挑战自动通过 → 再附加 chromedp。
 func runTrainer(username, password string, num int, dump bool) (int, error) {
-	if cdp := os.Getenv("CDP_URL"); cdp != "" {
+	if cdp := config.C.CDPURL; cdp != "" {
 		// 高级模式：接入你自己已打开并登录的浏览器（需开启远程调试端口）
-		log.Printf("已接入远程浏览器 %s，假设已登录，跳过自动登录", cdp)
+		slog.Info("已接入远程浏览器，假设已登录，跳过自动登录", "url", cdp)
 		alloctx, cancelAlloc := chromedp.NewRemoteAllocator(context.Background(), cdp)
 		defer cancelAlloc()
 		ctx, cancelCtx := chromedp.NewContext(alloctx)
@@ -88,11 +151,7 @@ func runTrainer(username, password string, num int, dump bool) (int, error) {
 	// 1) 原生启动 Chrome：启动参数打开登录页的那个标签页全程无任何 CDP 附加，
 	//    对 WAF 而言与真人打开无异，挑战可以自动通过。
 	//    同时从 stderr 读取浏览器级 WebSocket 地址（"DevTools listening on ws://..."）。
-	port := os.Getenv("CDP_PORT")
-	if port == "" {
-		port = "9223"
-	}
-	chromeCmd, browserWS, err := launchHumanChrome(port, userDataDir(), loginURL)
+	chromeCmd, browserWS, err := launchHumanChrome(config.C.CDPPort, config.UserDataDir(), config.URLLogin)
 	if err != nil {
 		return 0, err
 	}
@@ -102,7 +161,7 @@ func runTrainer(username, password string, num int, dump bool) (int, error) {
 	}()
 
 	// allocator 地址：优先用 stderr 读到的 ws://，兜底 http://127.0.0.1:port
-	allocURL := "http://127.0.0.1:" + port
+	allocURL := "http://127.0.0.1:" + config.C.CDPPort
 	if browserWS != "" {
 		allocURL = browserWS
 	}
@@ -119,8 +178,9 @@ func runTrainer(username, password string, num int, dump bool) (int, error) {
 	}
 
 	// 3) 固定等待：原生标签页无 CDP 干扰，挑战一般 10~15 秒内自动完成
-	log.Printf("等待 WAF 挑战自动通过（原生标签页无干扰加载中，约 20 秒）...")
-	time.Sleep(20 * time.Second)
+	slog.Info("等待 WAF 挑战自动通过（原生标签页无干扰加载中）",
+		"约", config.WaitWAFChallenge.String())
+	time.Sleep(config.WaitWAFChallenge)
 
 	// 4) 我们的标签页导航到登录页：此时浏览器内已有合法 WAF cookie，
 	//    服务器直接返回真实页面、不再下发挑战，也就不会触发 CDP 检测。
@@ -134,12 +194,12 @@ func runTrainer(username, password string, num int, dump bool) (int, error) {
 	}
 
 	// 6) 登录后停在 main.jsp 作业卡片列表：选一张卡进入答题页
-	//    （默认选标题含"刷题"的卡，可用 ASSIGN_KEYWORD 环境变量改）
+	//    （默认选标题含 ASSIGN_KEYWORD 的卡）
 	//    dump 模式下若进不去，也照样把当前页 dump 出来方便排查
 	quizCtx, cancelQuiz, err := enterAssignment(ctx, alloctx)
 	if err != nil {
 		if dump {
-			log.Printf("进入作业失败（%v），直接 dump 当前页面", err)
+			slog.Warn("进入作业失败，直接 dump 当前页面", "err", err)
 			dumpPage(ctx)
 			return 0, nil
 		}
@@ -154,20 +214,21 @@ func runTrainer(username, password string, num int, dump bool) (int, error) {
 
 // ensureLoginPage 导航到登录页并校验拿到的是真实页面（挑战未过时页面为空壳，等待重试）
 func ensureLoginPage(ctx context.Context) error {
-	for i := 1; i <= 3; i++ {
-		navCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
-		err := safeRun(navCtx, chromedp.Navigate(loginURL), chromedp.Sleep(5*time.Second))
+	for i := 1; i <= config.MaxLoginNavRetry; i++ {
+		navCtx, cancel := context.WithTimeout(ctx, config.TimeoutLoginNav)
+		err := safeRun(navCtx, chromedp.Navigate(config.URLLogin), chromedp.Sleep(5*time.Second))
 		var title string
 		var l int
 		_ = safeRun(navCtx, chromedp.Evaluate(`document.title`, &title))
 		_ = safeRun(navCtx, chromedp.Evaluate(`document.documentElement ? document.documentElement.outerHTML.length : -1`, &l))
 		cancel()
 		if err == nil && l > 2000 {
-			log.Printf("登录页就绪: title=%q len=%d", title, l)
+			slog.Info("登录页就绪", "title", title, "len", l)
 			return nil
 		}
-		log.Printf("登录页内容异常（len=%d title=%q err=%v），挑战可能仍在进行，10s 后重试（%d/3）", l, title, err, i)
-		time.Sleep(10 * time.Second)
+		slog.Warn("登录页内容异常，挑战可能仍在进行，稍后重试",
+			"len", l, "title", title, "err", err, "第几次", i, "共", config.MaxLoginNavRetry)
+		time.Sleep(config.WaitLoginNavRetry)
 	}
 	return fmt.Errorf("多次尝试后登录页仍不可用：WAF 挑战可能未通过，请重试")
 }
@@ -186,11 +247,11 @@ func solveLoop(ctx context.Context, num int, dump bool) (int, error) {
 		case "code":
 			s, finished, err := solveCode(ctx)
 			if err != nil {
-				log.Printf("第 %d 题处理出错: %v", i+1, err)
+				slog.Warn("编程题处理出错", "第几题", i+1, "err", err)
 				continue
 			}
 			if finished {
-				log.Printf("题目已全部完成，提前结束")
+				slog.Info("题目已全部完成，提前结束")
 				continue
 			}
 			total += s
@@ -208,8 +269,6 @@ func solveLoop(ctx context.Context, num int, dump bool) (int, error) {
 	return total, nil
 }
 
-const loginURL = "https://prg.cqupt.edu.cn/indexcs/simple.jsp?loginErr=0"
-
 // ===================== 进入作业（登录后主页是作业卡片列表） =====================
 
 // assignmentCardsJS 枚举 main.jsp 上的作业卡片：找文本含"进入作业/开始答题"的可见按钮，
@@ -217,9 +276,9 @@ const loginURL = "https://prg.cqupt.edu.cn/indexcs/simple.jsp?loginErr=0"
 // 返回 [{i, title, text, href}]。
 const assignmentCardsJS = `(function(){
   var out = [];
-  Array.from(document.querySelectorAll('a,button')).forEach(function(b){
+  Array.from(document.querySelectorAll('` + config.SelAnyLinkButton + `')).forEach(function(b){
     var t = (b.innerText || '').trim();
-    if (!/进入作业|开始答题|进入答题/.test(t)) return;
+    if (!/` + config.ReAssignmentBtn + `/.test(t)) return;
     if (b.offsetParent === null) return;
     var card = b;
     for (var k = 0; k < 8 && card.parentElement; k++) {
@@ -227,7 +286,7 @@ const assignmentCardsJS = `(function(){
       if ((card.innerText || '').length > 60) break;
     }
     var lines = (card.innerText || '').split('\n').map(function(s){ return s.trim(); })
-      .filter(function(s){ return s !== '' && s !== '作业' && !/进入作业|开始答题|作业时间|截止/.test(s); });
+      .filter(function(s){ return s !== '' && s !== '作业' && !/` + config.ReAssignmentNoise + `/.test(s); });
     out.push({i: out.length, title: (lines[0] || '').slice(0, 60), text: t, href: b.href || ''});
   });
   return JSON.stringify(out);
@@ -237,9 +296,9 @@ const assignmentCardsJS = `(function(){
 func assignmentClickJS(idx int) string {
 	return fmt.Sprintf(`(function(){
   var btns = [];
-  Array.from(document.querySelectorAll('a,button')).forEach(function(b){
+  Array.from(document.querySelectorAll('`+config.SelAnyLinkButton+`')).forEach(function(b){
     var t = (b.innerText || '').trim();
-    if (/进入作业|开始答题|进入答题/.test(t) && b.offsetParent !== null) btns.push(b);
+    if (/`+config.ReAssignmentBtn+`/.test(t) && b.offsetParent !== null) btns.push(b);
   });
   var b = btns[%d];
   if (!b) return 'no-btn';
@@ -262,28 +321,25 @@ func enterAssignment(ctx, alloctx context.Context) (context.Context, context.Can
 		Href  string `json:"href"`
 	}
 	found := false
-	for i := 0; i < 20; i++ {
-		pollCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	for i := 0; i < config.PollAssignmentMax; i++ {
+		pollCtx, cancel := context.WithTimeout(ctx, config.TimeoutAssignmentPoll)
 		_ = safeRun(pollCtx, chromedp.Evaluate(assignmentCardsJS, &raw))
 		cancel()
 		if err := json.Unmarshal([]byte(raw), &cards); err == nil && len(cards) > 0 {
 			found = true
 			break
 		}
-		time.Sleep(2 * time.Second)
+		time.Sleep(config.PollAssignmentTick)
 	}
 	if !found {
 		return nil, nil, fmt.Errorf("主页上没有找到任何'进入作业'按钮（可能页面未渲染，可 go run . -dump 查看）")
 	}
 
 	for _, c := range cards {
-		log.Printf("发现作业卡: [%d] %s（按钮 %q）", c.I, c.Title, c.Text)
+		slog.Info("发现作业卡", "序号", c.I, "标题", c.Title, "按钮", c.Text)
 	}
 
-	keyword := os.Getenv("ASSIGN_KEYWORD")
-	if keyword == "" {
-		keyword = "刷题"
-	}
+	keyword := config.C.AssignKeyword
 	choice := -1
 	for _, c := range cards {
 		if strings.Contains(c.Title, keyword) {
@@ -293,9 +349,9 @@ func enterAssignment(ctx, alloctx context.Context) (context.Context, context.Can
 	}
 	if choice < 0 {
 		choice = cards[0].I
-		log.Printf("没有标题含 %q 的作业卡，默认进入第一张（可用 ASSIGN_KEYWORD 环境变量指定）", keyword)
+		slog.Warn("没有标题匹配的作业卡，默认进入第一张", "关键词", keyword, "提示", "可用 ASSIGN_KEYWORD 环境变量指定")
 	}
-	log.Printf("进入作业卡 [%d] %s", choice, cards[choice].Title)
+	slog.Info("进入作业卡", "序号", choice, "标题", cards[choice].Title)
 
 	// 记录点击前的 URL 和已有标签页，用于判断是同页跳转还是新开标签页
 	var beforeHref string
@@ -307,7 +363,7 @@ func enterAssignment(ctx, alloctx context.Context) (context.Context, context.Can
 		}
 	}
 
-	clickCtx, cancelClick := context.WithTimeout(ctx, 10*time.Second)
+	clickCtx, cancelClick := context.WithTimeout(ctx, config.TimeoutAssignClick)
 	var resp string
 	_ = safeRun(clickCtx, chromedp.Evaluate(assignmentClickJS(choice), &resp))
 	cancelClick()
@@ -315,17 +371,17 @@ func enterAssignment(ctx, alloctx context.Context) (context.Context, context.Can
 		return nil, nil, fmt.Errorf("点击'进入作业'失败: %s", resp)
 	}
 
-	// 等结果：同页跳转（URL 变化）或新开标签页（出现新 target），最多 15s
-	for i := 0; i < 15; i++ {
-		time.Sleep(1 * time.Second)
+	// 等结果：同页跳转（URL 变化）或新开标签页（出现新 target）
+	for i := 0; i < config.PollAssignResultMax; i++ {
+		time.Sleep(config.PollAssignResultTick)
 
 		// 情况 1：同页跳转
 		var nowHref string
-		pollCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		pollCtx, cancel := context.WithTimeout(ctx, config.TimeoutSingleAction/2)
 		_ = safeRun(pollCtx, chromedp.Evaluate(`location.href`, &nowHref))
 		cancel()
-		if nowHref != "" && nowHref != beforeHref && !strings.Contains(nowHref, "main.jsp") {
-			log.Printf("已进入答题页（同页跳转）: %s", nowHref)
+		if nowHref != "" && nowHref != beforeHref && !strings.Contains(nowHref, config.URLMainPage) {
+			slog.Info("已进入答题页（同页跳转）", "url", nowHref)
 			return ctx, nil, nil
 		}
 
@@ -340,89 +396,25 @@ func enterAssignment(ctx, alloctx context.Context) (context.Context, context.Can
 					newCancel()
 					continue
 				}
-				log.Printf("已进入答题页（新标签页）: %s", t.URL)
+				slog.Info("已进入答题页（新标签页）", "url", t.URL)
 				return newCtx, newCancel, nil
 			}
 		}
 	}
-	return nil, nil, fmt.Errorf("点击'进入作业'后页面没有变化（超时 15s）")
+	return nil, nil, fmt.Errorf("点击'进入作业'后页面没有变化（超时）")
 }
 
 // ===================== 浏览器启动 / WAF 探测 / 附加 =====================
-
-// findChrome 查找 Chrome 可执行文件（支持 CHROME_PATH 覆盖）
-func findChrome() (string, error) {
-	if p := os.Getenv("CHROME_PATH"); p != "" {
-		return p, nil
-	}
-
-	// Windows 11 上 Chrome 默认装在【用户级目录】（%LOCALAPPDATA%），
-	// 只有管理员安装才在 Program Files，所以这里两个都列、优先 LOCALAPPDATA。
-	if runtime.GOOS == "windows" {
-		local := os.Getenv("LOCALAPPDATA") // 形如 C:\Users\xxx\AppData\Local
-		pf := os.Getenv("ProgramFiles")
-		pf86 := os.Getenv("ProgramFiles(x86)")
-		var cands []string
-		if local != "" {
-			cands = append(cands,
-				filepath.Join(local, `Google`, `Chrome`, `Application`, `chrome.exe`),  // 用户级 Chrome
-				filepath.Join(local, `Microsoft`, `Edge`, `Application`, `msedge.exe`), // 用户级 Edge
-			)
-		}
-		if pf != "" {
-			cands = append(cands, filepath.Join(pf, `Google`, `Chrome`, `Application`, `chrome.exe`))
-		}
-		if pf86 != "" {
-			cands = append(cands,
-				filepath.Join(pf86, `Google`, `Chrome`, `Application`, `chrome.exe`),
-				filepath.Join(pf86, `Microsoft`, `Edge`, `Application`, `msedge.exe`),
-			)
-		}
-		for _, p := range cands {
-			if _, err := os.Stat(p); err == nil {
-				return p, nil
-			}
-		}
-	}
-
-	candidates := []string{
-		"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-		"/Applications/Chromium.app/Contents/MacOS/Chromium",
-		"/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
-		`C:\Program Files\Google\Chrome\Application\chrome.exe`,
-		`C:\Program Files (x86)\Google\Chrome\Application\chrome.exe`,
-		"/usr/bin/google-chrome",
-		"/usr/bin/chromium",
-	}
-	for _, p := range candidates {
-		if _, err := os.Stat(p); err == nil {
-			return p, nil
-		}
-	}
-	if p, err := exec.LookPath("chrome"); err == nil {
-		return p, nil
-	}
-	if p, err := exec.LookPath("msedge"); err == nil {
-		return p, nil
-	}
-	if p, err := exec.LookPath("google-chrome"); err == nil {
-		return p, nil
-	}
-	if p, err := exec.LookPath("chromium"); err == nil {
-		return p, nil
-	}
-	return "", fmt.Errorf("未找到 Chrome/Edge 浏览器，请安装或用 CHROME_PATH 环境变量指定 chrome.exe 的完整路径")
-}
 
 // launchHumanChrome 以"真人方式"原生启动 Chrome：只开调试端口，不建立任何 CDP 会话。
 // 瑞数 WAF 检测的是 CDP 附加时的自动化副作用，这样启动时页面加载与真人无异。
 // 返回：进程句柄 + 浏览器级 WebSocket 地址（从 stderr 的 "DevTools listening on ws://..." 读到，可能为空）。
 func launchHumanChrome(port, profile, url string) (*exec.Cmd, string, error) {
-	bin, err := findChrome()
+	bin, err := config.FindChrome()
 	if err != nil {
 		return nil, "", err
 	}
-	log.Printf("使用浏览器: %s", bin)
+	slog.Info("使用浏览器", "path", bin)
 	cmd := exec.Command(bin,
 		"--remote-debugging-port="+port,
 		"--user-data-dir="+profile,
@@ -459,7 +451,7 @@ func launchHumanChrome(port, profile, url string) (*exec.Cmd, string, error) {
 	select {
 	case ws := <-wsCh:
 		return cmd, ws, nil
-	case <-time.After(15 * time.Second):
+	case <-time.After(config.TimeoutChromeWSWait):
 		// 没读到也不致命：调用方会退回 http://127.0.0.1:port
 		return cmd, "", nil
 	}
@@ -478,19 +470,17 @@ func safeRun(ctx context.Context, actions ...chromedp.Action) (err error) {
 
 // ===================== 自动登录（填表 + OCR 验证码 + 重试） =====================
 
-const maxLoginTry = 4
-
 // autoLogin 自动完成登录：填学号密码 → 截图验证码 → ddddocr 识别 → 提交 → 校验结果，
 // 失败自动刷新验证码重试；OCR 多次不过或 OCR 不可用时转人工兜底。
 func autoLogin(ctx context.Context, username, password string) error {
 	// 先判断是否已处于登录态：登录页被重定向（表单迟迟不出现 + URL 离开登录页）
 	// 说明 Cookie 有效，直接跳过登录。
-	for i := 0; i < 8; i++ {
+	for i := 0; i < config.PollExistingLoginMax; i++ {
 		var hasForm bool
 		var href string
-		checkCtx, cancelCheck := context.WithTimeout(ctx, 5*time.Second)
+		checkCtx, cancelCheck := context.WithTimeout(ctx, config.TimeoutSingleAction/2)
 		_ = safeRun(checkCtx,
-			chromedp.Evaluate(`!!document.querySelector('#username')`, &hasForm),
+			chromedp.Evaluate(fmt.Sprintf(`!!document.querySelector(%q)`, config.SelUsername), &hasForm),
 			chromedp.Evaluate(`location.href`, &href),
 		)
 		cancelCheck()
@@ -501,67 +491,67 @@ func autoLogin(ctx context.Context, username, password string) error {
 			fmt.Printf(">>> 检测到已有登录态（Cookie 有效，当前在 %s），跳过登录\n", href)
 			return nil
 		}
-		time.Sleep(2 * time.Second)
+		time.Sleep(config.PollExistingLoginTick)
 	}
 
 	// 等登录表单就绪（附加后标签页可能还在自刷新）
-	readyCtx, cancelReady := context.WithTimeout(ctx, 20*time.Second)
-	err := safeRun(readyCtx, chromedp.WaitReady(`#username`, chromedp.ByQuery))
+	readyCtx, cancelReady := context.WithTimeout(ctx, config.TimeoutLoginFormReady)
+	err := safeRun(readyCtx, chromedp.WaitReady(config.SelUsername, chromedp.ByQuery))
 	cancelReady()
 	if err != nil {
 		return fmt.Errorf("等待登录表单就绪失败: %w", err)
 	}
 
-	for i := 1; i <= maxLoginTry; i++ {
-		if err := fillInput(ctx, "#username", username); err != nil {
+	for i := 1; i <= config.MaxLoginTry; i++ {
+		if err := fillInput(ctx, config.SelUsername, username); err != nil {
 			return err
 		}
-		if err := fillInput(ctx, "#password", password); err != nil {
+		if err := fillInput(ctx, config.SelPassword, password); err != nil {
 			return err
 		}
 
 		// 截图验证码（所见即所得）
 		var png []byte
-		capCtx, cancelCap := context.WithTimeout(ctx, 15*time.Second)
-		err := chromedp.Run(capCtx, chromedp.Screenshot(`img[src="/cgjiaoyan"]`, &png, chromedp.NodeVisible, chromedp.ByQuery))
+		capCtx, cancelCap := context.WithTimeout(ctx, config.TimeoutCaptchaShot)
+		err := chromedp.Run(capCtx, chromedp.Screenshot(config.SelCaptchaImg, &png, chromedp.NodeVisible, chromedp.ByQuery))
 		cancelCap()
 		if err != nil {
-			log.Printf("截图验证码失败（%v），转人工登录", err)
+			slog.Warn("截图验证码失败，转人工登录", "err", err)
 			return manualLoginFallback(ctx)
 		}
-		imgPath := filepath.Join(os.TempDir(), "cqupt_captcha.png")
+		imgPath := filepath.Join(os.TempDir(), config.FileCaptchaTemp)
 		if err := os.WriteFile(imgPath, png, 0644); err != nil {
 			return fmt.Errorf("保存验证码图片失败: %w", err)
 		}
 
 		code, err := ocrCaptcha(imgPath)
 		if err != nil {
-			log.Printf("验证码 OCR 失败（%v），转人工登录", err)
+			slog.Warn("验证码 OCR 失败，转人工登录", "err", err)
 			return manualLoginFallback(ctx)
 		}
-		log.Printf("第 %d 次登录尝试：OCR 验证码 = %q", i, code)
-		if err := fillInput(ctx, "#captchaCode", code); err != nil {
+		slog.Info("登录尝试", "第几次", i, "OCR 验证码", code)
+		if err := fillInput(ctx, config.SelCaptchaCode, code); err != nil {
 			return err
 		}
 
-		submitCtx, cancelSub := context.WithTimeout(ctx, 10*time.Second)
-		_ = chromedp.Run(submitCtx, chromedp.Click(`#cgstuloginbtn`, chromedp.ByQuery))
+		submitCtx, cancelSub := context.WithTimeout(ctx, config.TimeoutLoginSubmit)
+		_ = chromedp.Run(submitCtx, chromedp.Click(config.SelLoginBtn, chromedp.ByQuery))
 		cancelSub()
 
-		ok, reason := waitLoginResult(ctx, 8*time.Second)
+		ok, reason := waitLoginResult(ctx)
 		if ok {
 			fmt.Println(">>> 自动登录成功！")
 			return nil
 		}
-		log.Printf("登录未成功（%s），刷新验证码后重试...", reason)
+		slog.Warn("登录未成功，刷新验证码后重试", "原因", reason)
 		// 点击验证码图片换新码
-		refreshCtx, cancelRef := context.WithTimeout(ctx, 10*time.Second)
-		_ = chromedp.Run(refreshCtx, chromedp.Click(`img[src="/cgjiaoyan"]`, chromedp.ByQuery))
+		refreshCtx, cancelRef := context.WithTimeout(ctx, config.TimeoutSingleAction)
+		_ = chromedp.Run(refreshCtx, chromedp.Click(config.SelCaptchaImg, chromedp.ByQuery))
 		cancelRef()
-		time.Sleep(1500 * time.Millisecond)
+		time.Sleep(config.WaitCaptchaRefresh)
 	}
 	// OCR 多次不过（可能验证码区分大小写），转人工兜底：浏览器是可见的，用户可直接输
-	log.Printf("OCR 连续 %d 次未过，转人工兜底", maxLoginTry)
+	slog.Warn("OCR 连续失败，转人工兜底", "次数", config.MaxLoginTry)
 	return manualLoginFallback(ctx)
 }
 
@@ -579,7 +569,7 @@ func fillInput(ctx context.Context, sel, val string) error {
 		el.blur();
 		return 'ok';
 	})()`, sel, string(valBytes))
-	fillCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	fillCtx, cancel := context.WithTimeout(ctx, config.TimeoutSingleAction)
 	defer cancel()
 	var resp string
 	if err := chromedp.Run(fillCtx, chromedp.Evaluate(js, &resp)); err != nil {
@@ -592,59 +582,38 @@ func fillInput(ctx context.Context, sel, val string) error {
 }
 
 // waitLoginResult 提交后轮询登录结果：密码框消失=成功；URL 带 loginErr=1=失败
-func waitLoginResult(ctx context.Context, d time.Duration) (bool, string) {
-	deadline := time.Now().Add(d)
+func waitLoginResult(ctx context.Context) (bool, string) {
+	deadline := time.Now().Add(time.Duration(config.PollLoginResultMax) * config.PollLoginResultTick)
 	for time.Now().Before(deadline) {
-		pollCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		pollCtx, cancel := context.WithTimeout(ctx, config.TimeoutSingleAction/2)
 		var href string
 		var hasPwd bool
 		_ = chromedp.Run(pollCtx, chromedp.Evaluate(`location.href`, &href))
-		_ = chromedp.Run(pollCtx, chromedp.Evaluate(`!!document.querySelector('#password')`, &hasPwd))
+		_ = chromedp.Run(pollCtx, chromedp.Evaluate(
+			fmt.Sprintf(`!!document.querySelector(%q)`, config.SelPassword), &hasPwd))
 		cancel()
-		if strings.Contains(href, "loginErr=1") {
+		if strings.Contains(href, config.TextLoginErrFlag) {
 			return false, "loginErr=1（验证码错误，或学号/密码错误）"
 		}
 		if !hasPwd && !strings.Contains(href, "loginErr") {
 			return true, ""
 		}
-		time.Sleep(800 * time.Millisecond)
+		time.Sleep(config.PollLoginResultTick)
 	}
 	return false, "等待登录结果超时"
 }
 
 // ocrCaptcha 调用 ddddocr 识别验证码图片。
-// python 优先级：PYTHON_BIN 环境变量 > 本机隔离 venv > 系统 python3。
-// findPython 选出可用的 python 解释器（用于跑 ddddocr 识别验证码）。
-// 优先级：PYTHON_BIN 环境变量 > 本机隔离 venv（macOS）> 系统命令。
-// Windows 上命令名是 python / py，Linux/macOS 是 python3，这里逐个探测取第一个存在的。
-func findPython() string {
-	if p := os.Getenv("PYTHON_BIN"); p != "" {
-		return p
-	}
-	venv := "/Users/lilinuo/.workbuddy/binaries/python/envs/default/bin/python"
-	if _, err := os.Stat(venv); err == nil {
-		return venv
-	}
-	names := []string{"python3", "python"}
-	if runtime.GOOS == "windows" {
-		// Windows 上 python3 通常不存在，python.exe / py 启动器才是常态
-		names = []string{"python", "py", "python3"}
-	}
-	for _, n := range names {
-		if p, err := exec.LookPath(n); err == nil {
-			return p
-		}
-	}
-	return names[0]
-}
-
+// python 解释器由 config.FindPython 按平台探测（优先隔离 venv，其次系统命令）。
 func ocrCaptcha(imgPath string) (string, error) {
-	py := findPython()
-	log.Printf("OCR 使用的 Python: %s", py)
-	script := filepath.Join("ocr", "ocr_captcha.py") // Windows 下自动用反斜杠分隔
+	py, err := config.FindPython()
+	if err != nil {
+		return "", err
+	}
+	script := filepath.Join(config.DirOcrScript, config.FileOcrScript)
 	out, err := exec.Command(py, script, imgPath).CombinedOutput()
 	if err != nil {
-		return "", fmt.Errorf("OCR 执行失败（python=%s）: %v（输出: %s）", py, err, strings.TrimSpace(string(out)))
+		return "", fmt.Errorf("OCR 执行失败: %v（输出: %s）", err, strings.TrimSpace(string(out)))
 	}
 	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
 	code := strings.TrimSpace(lines[len(lines)-1])
@@ -664,14 +633,15 @@ func manualLoginFallback(ctx context.Context) error {
 		stdin.ReadString('\n')
 		close(manualCh)
 	}()
-	deadline := time.Now().Add(10 * time.Minute)
+	deadline := time.Now().Add(config.TimeoutManualLogin)
 	seenForm := false
-	ticker := time.NewTicker(2 * time.Second)
+	ticker := time.NewTicker(config.PollManualLoginTick)
 	defer ticker.Stop()
 	for {
-		pollCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+		pollCtx, cancel := context.WithTimeout(ctx, config.TimeoutNavPollTick)
 		var hasPwd bool
-		_ = chromedp.Run(pollCtx, chromedp.Evaluate(`!!document.querySelector('#password')`, &hasPwd))
+		_ = chromedp.Run(pollCtx, chromedp.Evaluate(
+			fmt.Sprintf(`!!document.querySelector(%q)`, config.SelPassword), &hasPwd))
 		cancel()
 		if hasPwd {
 			seenForm = true
@@ -686,7 +656,7 @@ func manualLoginFallback(ctx context.Context) error {
 			return nil
 		case <-ticker.C:
 			if time.Now().After(deadline) {
-				return fmt.Errorf("等待登录超时（10 分钟）")
+				return fmt.Errorf("等待登录超时")
 			}
 		}
 	}
@@ -694,17 +664,17 @@ func manualLoginFallback(ctx context.Context) error {
 
 // detectMode 检测当前做题页类型：code（Monaco 编程题）或 quiz（整页单选填空题）
 func detectMode(ctx context.Context) string {
-	modeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	modeCtx, cancel := context.WithTimeout(ctx, config.TimeoutSingleAction)
 	defer cancel()
 	// 等页面渲染稳定后再判断
-	_ = chromedp.Run(modeCtx, chromedp.Sleep(2*time.Second))
+	_ = chromedp.Run(modeCtx, chromedp.Sleep(config.PollAssignmentTick))
 
 	var isCode, isQuiz bool
 	_ = chromedp.Run(modeCtx,
 		chromedp.Evaluate(`!!(window.monaco && monaco.editor && monaco.editor.getEditors && monaco.editor.getEditors().length > 0)`, &isCode),
 		chromedp.Evaluate(`(function(){
 			var t = document.body.innerText || '';
-			if (t.indexOf('单选填空') >= 0 || t.indexOf('单项选择题') >= 0) return true;
+			if (/`+config.TextQuizMarkers+`/.test(t)) return true;
 			return document.querySelectorAll('input[type="text"], input:not([type])').length > 0;
 		})()`, &isQuiz),
 	)
@@ -720,13 +690,13 @@ func detectMode(ctx context.Context) string {
 
 // solveCode 处理编程题（Monaco 编辑器）：取题干 -> AI 生成代码 -> 填入 -> 提交 -> 读分数
 func solveCode(ctx context.Context) (score int, finished bool, err error) {
-	mainCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
+	mainCtx, cancel := context.WithTimeout(ctx, config.TimeoutCodeQuestion)
 	defer cancel()
 
 	// 未刷完，获取题干
 	var question string
 	if err = chromedp.Run(mainCtx,
-		chromedp.Text(`.q-content`, &question, chromedp.ByQuery),
+		chromedp.Text(config.SelCodeQuestion, &question, chromedp.ByQuery),
 	); err != nil {
 		return 0, false, fmt.Errorf("获取题目失败: %w", err)
 	}
@@ -743,14 +713,14 @@ func solveCode(ctx context.Context) (score int, finished bool, err error) {
 
 	var scoreStr string
 	if err = chromedp.Run(mainCtx,
-		chromedp.WaitVisible(`.monaco-editor`, chromedp.ByQuery),
+		chromedp.WaitVisible(config.SelMonaco, chromedp.ByQuery),
 		chromedp.Evaluate(fillCodeJS, nil),
-		chromedp.WaitVisible(`//button[contains(., "提交")]`, chromedp.BySearch),
-		chromedp.Click(`//button[contains(., "提交")]`, chromedp.BySearch),
-		chromedp.WaitVisible(`//button[contains(., "确定")]`, chromedp.BySearch),
-		chromedp.Click(`//button[contains(., "确定")]`, chromedp.BySearch),
-		chromedp.WaitVisible(`tr[role="row"] td.mat-column-score`),
-		chromedp.Text(`tr[role="row"] td.mat-column-score`, &scoreStr),
+		chromedp.WaitVisible(config.XPathSubmitBtn, chromedp.BySearch),
+		chromedp.Click(config.XPathSubmitBtn, chromedp.BySearch),
+		chromedp.WaitVisible(config.XPathConfirmBtn, chromedp.BySearch),
+		chromedp.Click(config.XPathConfirmBtn, chromedp.BySearch),
+		chromedp.WaitVisible(config.SelScoreCell),
+		chromedp.Text(config.SelScoreCell, &scoreStr),
 	); err != nil {
 		return 0, false, fmt.Errorf("填充代码或提交失败: %w", err)
 	}
@@ -759,24 +729,26 @@ func solveCode(ctx context.Context) (score int, finished bool, err error) {
 	return scoreInt, false, nil
 }
 
+// ===================== 整页选择/填空题 =====================
+
 // quizListJS 枚举页面上所有内嵌题目表单（真实 DOM：form[name=answerForm{题号}]）。
 // 两种题干结构统一处理：选择题在 div[id^=tts{pid}text] 里、cloze 填空题直接是 form 内 <p>——
 // 都包含在 form 内，所以统一克隆 form、去掉输入控件后取 innerText。
 // 返回 [{pid, text, n, answered}]。
 const quizListJS = `(function(){
   var out = [];
-  document.querySelectorAll('form[name^="answerForm"]').forEach(function(f){
-    var m = f.name.match(/answerForm(\d+)/);
+  document.querySelectorAll('` + config.SelQuizForm + `').forEach(function(f){
+    var m = f.name.match(/` + config.ReQuizPid + `/);
     if (!m) return;
     var pid = m[1];
     var c = f.cloneNode(true);
     c.querySelectorAll('input,button,select,textarea,script').forEach(function(e){ e.remove(); });
     var text = (c.innerText || '').trim().slice(0, 1500);
-    var inputs = f.querySelectorAll('input[name^="answer"]');
+    var inputs = f.querySelectorAll('` + config.SelQuizInput + `');
     var answered = false;
     inputs.forEach(function(inp){ if ((inp.value||'').trim() !== '') answered = true; });
-    var tip = document.getElementById('saveTip'+pid);
-    if (tip && (tip.innerText||'').indexOf('已提交') >= 0) answered = true;
+    var tip = document.getElementById('` + config.SelQuizSaveTipPrefix + `'+pid);
+    if (tip && (tip.innerText||'').indexOf('` + config.TextQuizSubmitted + `') >= 0) answered = true;
     if (inputs.length === 0) return;
     out.push({pid: pid, text: text, n: inputs.length, answered: answered});
   });
@@ -786,14 +758,13 @@ const quizListJS = `(function(){
 // quizFillJS 填入第 pid 题的答案并触发自动提交：
 // 全部输入框用原生 setter 填好值后，在最后一个 input 上派发 input + change 事件
 // （选择题 oninput=form.submit()；cloze 填空 oninput=cgClozeInput + onchange=cgClozeChange，
-//
-//	提交到隐藏 iframe frame_problemhandler，页面不刷新）。
+// 提交到隐藏 iframe frame_problemhandler，页面不刷新）。
 func quizFillJS(pid string, answers []string) string {
 	ansBytes, _ := json.Marshal(answers)
 	return fmt.Sprintf(`(function(){
   var f = document.forms['answerForm%[1]s'];
   if (!f) return 'no-form';
-  var inputs = Array.from(f.querySelectorAll('input[name^="answer"]'));
+  var inputs = Array.from(f.querySelectorAll('`+config.SelQuizInput+`'));
   if (inputs.length !== %[2]d) return 'count-mismatch:'+inputs.length;
   var answers = %[3]s;
   var set = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
@@ -808,36 +779,157 @@ func quizFillJS(pid string, answers []string) string {
 })()`, pid, len(answers), string(ansBytes))
 }
 
-// quizCheckJS 检查第 pid 题的 saveTip 是否已变为"已提交"
-func quizCheckJS(pid string) string {
+// quizTipJS 读取第 pid 题的状态提示原文（可能形如"已提交"，若有分数也会一并带出）
+func quizTipJS(pid string) string {
 	return fmt.Sprintf(`(function(){
-  var tip = document.getElementById('saveTip%s');
-  if (!tip) return 'no-tip';
-  return (tip.innerText || '').indexOf('已提交') >= 0 ? 'ok' : 'pending';
-})()`, pid)
+  var tip = document.getElementById('%s' + %q);
+  return tip ? (tip.innerText || '').trim() : '';
+})()`, config.SelQuizSaveTipPrefix, pid)
 }
 
-// quizScoreJS 从页面读取 "总分: x.xx"
+// quizScoreJS 从页面读取 "总分: x.xx"（读不到返回空串）
 const quizScoreJS = `(function(){
-  var m = (document.body.innerText || '').match(/总分[:：]\s*([\d.]+)/);
+  var m = (document.body.innerText || '').match(/` + config.ReTotalScoreJS + `/);
   return m ? m[1] : '';
 })()`
 
+// readTotalScore 读取页面总分；读不到返回 -1。
+//
+// 返回值语义：>= 0 是真实分数；-1 表示本页没有总分区域（例如题目页而非作业页）。
+// 调用方必须先判断是否为负，否则会把"读不到"误当成"得了 0 分"。
+func readTotalScore(ctx context.Context) float64 {
+	var s string
+	if err := safeRun(ctx, chromedp.Evaluate(quizScoreJS, &s)); err != nil {
+		return -1
+	}
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return -1
+	}
+	f, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return -1
+	}
+	return f
+}
+
+// waitScoreChange 提交后等总分发生变化（服务器算分需要时间），
+// 返回新总分；若在等待窗口内没变，返回 before 本身。
+func waitScoreChange(ctx context.Context, before float64) float64 {
+	deadline := time.Now().Add(config.WaitScoreChange)
+	for time.Now().Before(deadline) {
+		time.Sleep(config.PollScoreTick)
+		now := readTotalScore(ctx)
+		if now >= 0 && now != before {
+			return now
+		}
+	}
+	return before
+}
+
+// quizItem 是一道内嵌题的元信息
+type quizItem struct {
+	Pid      string `json:"pid"`
+	Text     string `json:"text"`
+	N        int    `json:"n"`
+	Answered bool   `json:"answered"`
+}
+
+// genQuizAnswers 生成某道题的答案；try > 1 时带上重答提醒。
+func genQuizAnswers(it quizItem, try int) ([]string, error) {
+	hint := ""
+	if try > 1 {
+		hint = ai.Prompts.ReanswerSuffix
+	}
+	if it.N == 1 {
+		letter, err := ai.AnswerChoice(it.Text, hint)
+		if err != nil {
+			return nil, err
+		}
+		return []string{letter}, nil
+	}
+	return ai.AnswerMulti(it.Text, it.N, hint)
+}
+
+// solveQuizItem 作答单道题，含"提交后回读得分 → 不达标则重答"的闭环。
+//
+// 返回该题的最终得分；-1 表示"得分无法判定"（页面没有总分区域等），
+// 这种情况下不做重答，避免把读不到分数误判成答错。
+func solveQuizItem(ctx context.Context, it quizItem) float64 {
+	lastScore := -1.0
+	for try := 1; try <= config.C.MaxAnswerTry; try++ {
+		before := readTotalScore(ctx)
+
+		answers, err := genQuizAnswers(it, try)
+		if err != nil {
+			slog.Error("生成答案失败", "pid", it.Pid, "err", err)
+			return lastScore
+		}
+		if try > 1 {
+			slog.Info("重答中", "pid", it.Pid, "第几次", try, "上次得分", lastScore)
+		}
+
+		var resp string
+		if err := safeRun(ctx, chromedp.Evaluate(quizFillJS(it.Pid, answers), &resp)); err != nil || resp != "ok" {
+			slog.Error("填入答案失败", "pid", it.Pid, "resp", resp, "err", err)
+			return lastScore
+		}
+
+		// 等自动提交生效（saveTip 变"已提交"）
+		submitted := false
+		for i := 0; i < config.PollQuizSubmittedMax; i++ {
+			time.Sleep(config.PollQuizSubmittedTick)
+			var tip string
+			_ = safeRun(ctx, chromedp.Evaluate(quizTipJS(it.Pid), &tip))
+			if strings.Contains(tip, config.TextQuizSubmitted) {
+				submitted = true
+				break
+			}
+		}
+		if !submitted {
+			slog.Warn("未确认到提交状态（可能仍在处理）", "pid", it.Pid)
+			return lastScore
+		}
+
+		// 回读得分：用提交前后的总分差值，得到"这一题贡献了多少分"
+		if before < 0 {
+			// 页面没有总分区域，无法判定得分 —— 保持改造前的行为（提交完就往下走）
+			slog.Info("题目已提交（本页无总分区域，跳过得分回读）", "pid", it.Pid)
+			return -1
+		}
+		after := waitScoreChange(ctx, before)
+		delta := after - before
+		if delta < 0 {
+			delta = 0
+		}
+		lastScore = delta
+
+		if !config.C.ShouldReanswer(delta, try) {
+			if delta > 0 {
+				slog.Info("题目已提交并得分", "pid", it.Pid, "得分", delta, "总分", after)
+			} else {
+				slog.Info("题目已提交", "pid", it.Pid, "得分", delta, "总分", after)
+			}
+			return lastScore
+		}
+		slog.Warn("本次得分未达阈值，准备重答", "pid", it.Pid, "得分", delta, "已尝试", try, "上限", config.C.MaxAnswerTry)
+	}
+
+	// 次数用尽仍未达标：记录到错题文件，便于事后复盘
+	recordWrongAnswer(it, lastScore)
+	return lastScore
+}
+
 // solveQuizPage 处理主页上的整卷选择/填空题（最多做 num 道未提交的）：
-// 等页面渲染 -> 枚举题目 -> 逐题 AI 作答并填入（自动提交）-> 校验已提交 -> 读总分
+// 等页面渲染 -> 枚举题目 -> 逐题 AI 作答并填入 -> 校验已提交 -> 回读得分 -> 读总分
 func solveQuizPage(ctx context.Context, num int) (int, error) {
-	quizCtx, cancel := context.WithTimeout(ctx, 60*time.Minute)
+	quizCtx, cancel := context.WithTimeout(ctx, config.TimeoutQuizPage)
 	defer cancel()
 
-	// 等动态渲染：轮询直到题目表单出现（最多 60s）
+	// 等动态渲染：轮询直到题目表单出现
 	var raw string
-	var items []struct {
-		Pid      string `json:"pid"`
-		Text     string `json:"text"`
-		N        int    `json:"n"`
-		Answered bool   `json:"answered"`
-	}
-	for i := 0; i < 30; i++ {
+	var items []quizItem
+	for i := 0; i < config.PollQuizListMax; i++ {
 		if err := safeRun(quizCtx, chromedp.Evaluate(quizListJS, &raw)); err != nil {
 			return 0, fmt.Errorf("读取题目列表失败: %w", err)
 		}
@@ -847,7 +939,7 @@ func solveQuizPage(ctx context.Context, num int) (int, error) {
 		if len(items) > 0 {
 			break
 		}
-		time.Sleep(2 * time.Second)
+		time.Sleep(config.PollQuizListTick)
 	}
 	if len(items) == 0 {
 		return 0, fmt.Errorf("页面上没有找到题目表单（answerForm），可能不在作业页上")
@@ -859,7 +951,7 @@ func solveQuizPage(ctx context.Context, num int) (int, error) {
 			unanswered++
 		}
 	}
-	log.Printf("共 %d 道题，其中 %d 道未提交，本次最多做 %d 道", len(items), unanswered, num)
+	slog.Info("题目枚举完成", "总数", len(items), "未提交", unanswered, "本次最多做", num)
 
 	done, failed := 0, 0
 	for _, it := range items {
@@ -872,83 +964,76 @@ func solveQuizPage(ctx context.Context, num int) (int, error) {
 		done++
 		fmt.Printf("[%d] 题 %s 解答中（%d 个空）...\n", done, it.Pid, it.N)
 
-		var answers []string
-		var err error
-		if it.N == 1 {
-			var letter string
-			letter, err = ai.AnswerChoice(it.Text)
-			answers = []string{letter}
-		} else {
-			answers, err = ai.AnswerMulti(it.Text, it.N)
-		}
-		if err != nil {
-			log.Printf("题 %s 生成答案失败: %v", it.Pid, err)
+		s := solveQuizItem(ctx, it)
+		switch {
+		case s < 0:
+			slog.Info("题目已处理（本页无法判定得分）", "pid", it.Pid)
+		case s == 0:
+			slog.Warn("题目已提交但未得分", "pid", it.Pid)
 			failed++
-			continue
-		}
-
-		var resp string
-		if err := safeRun(quizCtx, chromedp.Evaluate(quizFillJS(it.Pid, answers), &resp)); err != nil || resp != "ok" {
-			log.Printf("题 %s 填入失败: %v %s", it.Pid, err, resp)
-			failed++
-			continue
-		}
-
-		// 等自动提交生效（saveTip 变"已提交"），最多 8 秒
-		ok := false
-		for i := 0; i < 8; i++ {
-			time.Sleep(1 * time.Second)
-			var st string
-			_ = safeRun(quizCtx, chromedp.Evaluate(quizCheckJS(it.Pid), &st))
-			if st == "ok" {
-				ok = true
-				break
-			}
-		}
-		if ok {
-			log.Printf("题 %s 已提交 ✓", it.Pid)
-		} else {
-			log.Printf("题 %s 未确认到提交状态（可能仍在处理，继续下一题）", it.Pid)
-			failed++
+		default:
+			slog.Info("题目已得分", "pid", it.Pid, "得分", s)
 		}
 	}
-	log.Printf("完成：提交 %d 道，失败/未确认 %d 道", done-failed, failed)
+	slog.Info("完成", "本轮处理", done, "疑似失分", failed)
 
 	// 读取总分
-	time.Sleep(2 * time.Second)
-	var scoreStr string
-	_ = safeRun(quizCtx, chromedp.Evaluate(quizScoreJS, &scoreStr))
-	scoreFloat, _ := strconv.ParseFloat(strings.TrimSpace(scoreStr), 64)
-	if scoreStr == "" {
-		log.Printf("未能读取到总分")
+	time.Sleep(config.WaitBeforeReadScore)
+	total := readTotalScore(quizCtx)
+	if total < 0 {
+		slog.Warn("未能读取到总分")
+		return 0, nil
 	}
-	return int(scoreFloat), nil
+	slog.Info("页面总分", "score", total)
+	return int(total), nil
+}
+
+// recordWrongAnswer 把一道反复答不对的题写入错题文件。
+// 只做记录、不中断流程——刷题是批量任务，中途停下来反而更糟。
+func recordWrongAnswer(it quizItem, score float64) {
+	f, err := os.OpenFile(config.FileWrongAnswers, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		slog.Warn("写入错题文件失败", "err", err)
+		return
+	}
+	defer f.Close()
+
+	ts := time.Now().Format("2006-01-02 15:04:05")
+	var b strings.Builder
+	fmt.Fprintf(&b, "\n## 题 %s（%s，得分 %g）\n\n", it.Pid, ts, score)
+	fmt.Fprintf(&b, "**空数**：%d ｜ **已尝试**：%d 次\n\n", it.N, config.C.MaxAnswerTry)
+	fmt.Fprintf(&b, "**题干**：\n\n```\n%s\n```\n", it.Text)
+	if _, err := f.WriteString(b.String()); err != nil {
+		slog.Warn("写入错题文件失败", "err", err)
+		return
+	}
+	slog.Warn("已记入错题文件，便于事后复盘", "file", config.FileWrongAnswers, "pid", it.Pid)
 }
 
 // dumpPage 把当前页面 HTML 保存到 page.html，用于确认真实 DOM 结构后精修选择器。
 // 登录后的主页面是 JS 动态渲染的，先轮询等 body 真正有内容再 dump，
 // 同时打印所有链接/按钮清单，帮助定位"做题/练习"入口。
 func dumpPage(ctx context.Context) {
-	dumpCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
+	dumpCtx, cancel := context.WithTimeout(ctx, config.TimeoutDump)
 	defer cancel()
 
-	// 等待动态内容渲染：轮询 body 文本长度，直到有实质内容（或 30s 超时）
-	log.Printf("等待页面动态内容渲染...")
-	for i := 0; i < 15; i++ {
+	// 等待动态内容渲染：轮询 body 文本长度，直到有实质内容
+	slog.Info("等待页面动态内容渲染...")
+	for i := 0; i < config.PollDumpMax; i++ {
 		var bodyLen int
 		_ = chromedp.Run(dumpCtx, chromedp.Evaluate(`document.body ? (document.body.innerText||'').trim().length : -1`, &bodyLen))
-		if bodyLen > 30 {
-			log.Printf("页面内容已渲染（正文 %d 字符）", bodyLen)
+		if bodyLen > config.RenderTextThreshold {
+			slog.Info("页面内容已渲染", "正文字符数", bodyLen)
 			break
 		}
-		time.Sleep(2 * time.Second)
+		time.Sleep(config.PollRenderTick)
 	}
 
 	// 直接执行 JS 取整页 HTML，避免 chromedp 的"等待元素"动作在 frameset 等
 	// 老式页面结构上挂起而超时
 	var html string
 	if err := chromedp.Run(dumpCtx, chromedp.Evaluate(`document.documentElement.outerHTML`, &html)); err != nil {
-		log.Printf("dump 页面失败: %v", err)
+		slog.Error("dump 页面失败", "err", err)
 		return
 	}
 
@@ -956,7 +1041,7 @@ func dumpPage(ctx context.Context) {
 	var href, title string
 	_ = chromedp.Run(dumpCtx, chromedp.Evaluate(`location.href`, &href))
 	_ = chromedp.Run(dumpCtx, chromedp.Evaluate(`document.title`, &title))
-	log.Printf("[诊断] dump 时页面 href=%s title=%q 长度=%d", href, title, len(html))
+	slog.Info("[诊断] dump 结果", "href", href, "title", title, "长度", len(html))
 
 	// 打印所有链接和可见按钮文本，用于定位做题入口
 	var navInfo string
@@ -969,20 +1054,11 @@ func dumpPage(ctx context.Context) {
 		}).filter(function(t){return t!=='';});
 		return {links:links, buttons:btns};
 	})())`, &navInfo))
-	log.Printf("[诊断] 页面导航元素: %s", navInfo)
+	slog.Info("[诊断] 页面导航元素", "nav", navInfo)
 
-	if err := os.WriteFile("page.html", []byte(html), 0644); err != nil {
-		log.Printf("写 page.html 失败: %v", err)
+	if err := os.WriteFile(config.FileDumpQuiz, []byte(html), 0644); err != nil {
+		slog.Error("写 dump 文件失败", "file", config.FileDumpQuiz, "err", err)
 		return
 	}
-	log.Printf("已保存页面结构到 page.html（%d 字节）", len(html))
-}
-
-// userDataDir 返回持久化的浏览器用户目录，登录态（Cookie）会存于此。
-// 登录成功后 Cookie 持久化，之后运行可自动复用，不必每次输验证码。
-func userDataDir() string {
-	if d := os.Getenv("CHROME_USER_DATA"); d != "" {
-		return d
-	}
-	return ".chrome-profile"
+	slog.Info("已保存页面结构", "file", config.FileDumpQuiz, "字节", len(html))
 }

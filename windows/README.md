@@ -1,6 +1,6 @@
 # 重庆邮电大学程序设计平台自动刷题脚本（Windows 11 + Chrome 版）
 
-> **版本：v1.1.1（2026-09-23）** ｜ **平台：Windows 11** ｜ 更新日志见根目录 [CHANGELOG.md](../CHANGELOG.md)
+> **版本：v1.2.0（2026-09-24）** ｜ **平台：Windows 11** ｜ 更新日志见根目录 [CHANGELOG.md](../CHANGELOG.md)
 
 > ⚠️ **仅限个人学习交流，严禁用于任何盈利目的**；使用风险自负（详见根目录 [README](../README.md) 的免责声明）。
 > ⭐ 觉得好用的话，欢迎给仓库点个 **Star**。
@@ -55,9 +55,14 @@ go run .
 
 # 刷程序片段编程题
 go run . -mode=progap
+
+# （可选）生成 Prompt 模板，方便不改代码调提示词
+go run . -prompts-init
 ```
 
 按提示依次输入 **学号 → 密码 → 想刷的题目数量**（建议先填 1~3 验证，确认没问题再放量）。
+
+**v1.2.0 新增**：每题提交前后各读一次页面总分，差值即该题得分；没得分可按策略重答（选择/填空题同页重填，程序题重新打开题目页）。次数用尽仍不得分的题记入 `wrong_answers.md`。
 
 ## 三、⚠️ Windows 上的重要注意事项
 
@@ -71,20 +76,55 @@ go run . -mode=progap
    go run .
    ```
 
-## 四、参数一览
+## 四、项目结构
 
-| 项 | 作用 |
-|----|------|
-| `-mode=quiz` | 默认，整页选择/填空题 |
-| `-mode=progap` | 程序片段编程题 |
-| `-mode=progapdump` | 只 dump 第一道程序题页面到 progap.html（调试用） |
-| `-dump` | quiz 模式下 dump 答题页到 page.html（调试用） |
-| `ASSIGN_KEYWORD` | 有多张作业卡时按标题关键词选卡（默认"刷题"），例如 `$env:ASSIGN_KEYWORD="平时"` |
-| `CHROME_PATH` | 自定义 chrome.exe 路径 |
-| `PYTHON_BIN` | 自定义 python 解释器路径 |
-| `CDP_PORT` | 调试端口（默认 9223） |
+```
+main.go        # 登录 + 过 WAF + 选择/填空题流程 + 得分闭环
+progap.go      # 程序片段编程题流程 + 判题回显解析
+main_test.go   # 单测
+config/        # ★ 全部可调项的集中地
+  config.go    #   环境变量读取 + 重答策略
+  site.go      #   站点选择器/XPath/正则/文案 + 所有超时参数
+  env.go       #   平台差异唯一来源（Chrome 路径 / Python 探测 / profile 目录）
+ai/            # 大模型调用 + Prompt 管理（prompts.go）
+ocr/           # ddddocr 验证码识别
+tools/         # 排查用的小工具（aitest / attachtest / logindump / wafprobe）
+```
 
-## 五、常见问题
+**站点改版了就改 `config/site.go`，其余代码基本不用动。**
+
+## 五、参数一览
+
+| 项 | 默认 | 作用 |
+|----|------|------|
+| `-mode=quiz` | — | 默认，整页选择/填空题 |
+| `-mode=progap` | — | 程序片段编程题 |
+| `-mode=progapdump` | — | 只 dump 第一道程序题页面到 progap.html（调试用） |
+| `-dump` | — | quiz 模式下 dump 答题页到 page.html（调试用） |
+| `-log-json` | — | 日志改输出 JSON 格式 |
+| `-prompts-init` | — | 生成 prompts.example.json 后退出 |
+| `ASSIGN_KEYWORD` | `刷题` | 有多张作业卡时按标题关键词选卡，例如 `$env:ASSIGN_KEYWORD="平时"` |
+| `CHROME_PATH` | 自动探测 | 自定义 chrome.exe 路径 |
+| `CHROME_USER_DATA` | `.chrome-profile` | 浏览器 profile 目录 |
+| `CDP_PORT` | `9223` | 调试端口 |
+| `CDP_URL` | 空 | 接入已开着的浏览器，跳过自动登录 |
+| `PYTHON_BIN` | 自动探测 | 自定义 python 解释器路径 |
+| `REANSWER_THRESHOLD` | `0` | 得分 ≤ 此值即重答；`-1` = 从不重答 |
+| `MAX_ANSWER_TRY` | `2` | 单题最多作答次数（含首次），最小 1 |
+| `PROMPTS_FILE` | `prompts.json` | Prompt 覆盖文件路径 |
+| `LOG_FORMAT` | `text` | 日志格式：`text` / `json` |
+
+> 想要「和旧版 v1.1.1 完全一样」的行为：设 `MAX_ANSWER_TRY=1` 或 `REANSWER_THRESHOLD=-1`。
+
+## 六、开发 / 自测
+
+```powershell
+go build ./...     # 编译
+go vet ./...       # 静态检查
+go test ./...      # 单测（99 个用例）
+```
+
+## 七、常见问题
 
 | 现象 | 原因 / 处理 |
 |------|------------|
@@ -92,7 +132,9 @@ go run . -mode=progap
 | `OCR 执行失败` | `pip install ddddocr` 没装好，或 Python 没加入 PATH；设 `PYTHON_BIN` 指定 |
 | 页面空白 / 一直连不上 | 先关掉所有 Chrome 窗口再跑 |
 | `ai初始化失败` | `.env` 没建或 Key 填错（注意别用 `copy` 出来的模板原名 `.env.example`） |
-| 某题得分 0 | 模型能力问题，可换更强的模型接入点 |
+| 某题得分 0 | 模型能力问题，可换更强的模型接入点；或调高 `REANSWER_THRESHOLD` 让它多试几次 |
+| 反复重答还是 0 分 | 说明模型确实做不出来，题目会记进 `wrong_answers.md` |
+| 想省 token | 设 `MAX_ANSWER_TRY=1`，只答一次不重试 |
 
 ## 效果图
 

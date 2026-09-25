@@ -4,28 +4,31 @@ package main
 // progap.go —— 程序片段编程题（programFillGapList.jsp）答题支持
 //
 // 设计原则：
-//  1. 全部逻辑在本文件内自成一派，不修改 main.go 里已经跑通的整页刷题（quiz）逻辑；
+//  1. 全部逻辑在本文件内自成一派，不改动 main.go 里已经跑通的整页刷题（quiz）逻辑；
 //     main.go 只在入口加了一个 -mode 开关分支（默认 quiz，行为与之前完全一致）。
 //  2. 复用 main.go 里已有的通用件：launchHumanChrome / ensureLoginPage /
 //     autoLogin / enterAssignment（WAF 绕过、OCR 登录、选作业卡），不重复造轮子。
-//  3. 程序题答题页的 DOM 结构未知，所以本文件内含"结构探测 + 自动 dump"：
-//     处理第一题时会把页面存成 progap.html 并打印页面结构（编辑器类型、
-//     输入框数量、按钮清单），据此可以精确调整选择器。
+//  3. 页面结构不确定时先"探测 + dump"，再据此精修选择器；
+//     结构完全对不上时走 progapAnswerOneGeneric 通用兜底分支。
+//  4. 提交后回读判题结果：不通过则在剩余次数内换个思路重答（见 judgeProgapResult）。
+//
+// 所有选择器/超时/阈值都来自 config 包，站点改版时只需改 config/site.go。
 // ============================================================================
 
 import (
 	"context"
+	"cqupt/ai"
+	"cqupt/config"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"log"
-	"main/ai"
+	"log/slog"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/chromedp/chromedp"
-	"github.com/cloudwego/eino/schema"
 )
 
 // modeFlag 运行模式：
@@ -35,14 +38,16 @@ import (
 //	progapdump 只进入第一道程序题并把页面存成 progap.html（用于调选择器）
 var modeFlag = flag.String("mode", "quiz", "运行模式：quiz=整页选择填空（默认）；progap=程序片段编程题；progapdump=只 dump 程序题页面")
 
+// 判题回显的关键词匹配器（编译一次，避免每题重复编译）
+var (
+	progapFailRe = regexp.MustCompile(config.ReProgapFailKeywords)
+	progapPassRe = regexp.MustCompile(config.ReProgapPassKeywords)
+)
+
 // runProgap 程序题完整流程：启动浏览器 → 登录 → 进入作业 → 作答。
 // dumpOnly=true 时只 dump 第一道程序题页面后返回。
 func runProgap(username, password string, num int, dumpOnly bool) (int, error) {
-	port := os.Getenv("CDP_PORT")
-	if port == "" {
-		port = "9223"
-	}
-	chromeCmd, browserWS, err := launchHumanChrome(port, userDataDir(), loginURL)
+	chromeCmd, browserWS, err := launchHumanChrome(config.C.CDPPort, config.UserDataDir(), config.URLLogin)
 	if err != nil {
 		return 0, err
 	}
@@ -51,7 +56,7 @@ func runProgap(username, password string, num int, dumpOnly bool) (int, error) {
 		_ = chromeCmd.Wait()
 	}()
 
-	allocURL := "http://127.0.0.1:" + port
+	allocURL := "http://127.0.0.1:" + config.C.CDPPort
 	if browserWS != "" {
 		allocURL = browserWS
 	}
@@ -64,8 +69,8 @@ func runProgap(username, password string, num int, dumpOnly bool) (int, error) {
 		return 0, fmt.Errorf("建立浏览器控制连接失败: %w", err)
 	}
 
-	log.Printf("等待 WAF 挑战自动通过（约 20 秒）...")
-	time.Sleep(20 * time.Second)
+	slog.Info("等待 WAF 挑战自动通过", "约", config.WaitWAFChallenge.String())
+	time.Sleep(config.WaitWAFChallenge)
 
 	if err := ensureLoginPage(ctx); err != nil {
 		return 0, err
@@ -98,7 +103,7 @@ func runProgap(username, password string, num int, dumpOnly bool) (int, error) {
 // 返回 [{i, title, href, status, done}]，done=true 表示已经提交过（跳过）。
 const progapListJS = `(function(){
   var out = [];
-  Array.from(document.querySelectorAll('a[href*="programFillGapList"]')).forEach(function(a){
+  Array.from(document.querySelectorAll('` + config.SelProgapListLink + `')).forEach(function(a){
     if (a.offsetParent === null) return;
     var tr = a.closest('tr');
     var status = '';
@@ -106,7 +111,7 @@ const progapListJS = `(function(){
       var cells = Array.from(tr.querySelectorAll('td,th')).map(function(c){ return (c.innerText||'').trim(); });
       status = cells[cells.length-1] || '';
     }
-    var done = !/还未提交|未提交/.test(status);
+    var done = !/` + config.ReProgapNotSubmitted + `/.test(status);
     out.push({i: out.length, title: (a.innerText||'').trim().slice(0,80), href: a.href, status: status.slice(0,40), done: done});
   });
   return JSON.stringify(out);
@@ -124,14 +129,14 @@ type progapItem struct {
 func progapEnumerate(ctx context.Context) ([]progapItem, error) {
 	var raw string
 	var items []progapItem
-	for i := 0; i < 20; i++ {
-		pollCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	for i := 0; i < config.PollAssignmentMax; i++ {
+		pollCtx, cancel := context.WithTimeout(ctx, config.TimeoutAssignmentPoll)
 		_ = safeRun(pollCtx, chromedp.Evaluate(progapListJS, &raw))
 		cancel()
 		if err := json.Unmarshal([]byte(raw), &items); err == nil && len(items) > 0 {
 			return items, nil
 		}
-		time.Sleep(2 * time.Second)
+		time.Sleep(config.PollAssignmentTick)
 	}
 	return nil, fmt.Errorf("作业页上没有找到程序片段编程题（programFillGapList 链接）")
 }
@@ -173,7 +178,7 @@ type progapProbeInfo struct {
 func progapProbe(ctx context.Context) (progapProbeInfo, error) {
 	var p progapProbeInfo
 	var raw string
-	probeCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	probeCtx, cancel := context.WithTimeout(ctx, config.TimeoutProgapProbe)
 	defer cancel()
 	if err := safeRun(probeCtx, chromedp.Evaluate(progapProbeJS, &raw)); err != nil {
 		return p, err
@@ -190,54 +195,61 @@ func progapDumpFirst(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	log.Printf("共 %d 道程序题，dump 第一道：%s (%s)", len(items), items[0].Title, items[0].Href)
+	slog.Info("准备 dump 第一道程序题", "总数", len(items), "标题", items[0].Title, "href", items[0].Href)
 
-	navCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	navCtx, cancel := context.WithTimeout(ctx, config.TimeoutProgapListNav)
 	defer cancel()
 	if err := safeRun(navCtx, chromedp.Navigate(items[0].Href)); err != nil {
 		return err
 	}
 	// 等页面渲染
-	for i := 0; i < 15; i++ {
+	for i := 0; i < config.PollProgapRenderMax; i++ {
 		var l int
 		_ = safeRun(navCtx, chromedp.Evaluate(`(document.body.innerText||'').trim().length`, &l))
 		if l > 100 {
 			break
 		}
-		time.Sleep(2 * time.Second)
+		time.Sleep(config.PollRenderTick)
 	}
 
 	var html string
 	_ = safeRun(navCtx, chromedp.Evaluate(`document.documentElement.outerHTML`, &html))
-	if err := os.WriteFile("progap.html", []byte(html), 0644); err != nil {
-		log.Printf("写 progap.html 失败: %v", err)
+	if err := os.WriteFile(config.FileDumpProgap, []byte(html), 0644); err != nil {
+		slog.Error("写 dump 文件失败", "file", config.FileDumpProgap, "err", err)
 	} else {
-		log.Printf("已保存程序题页面到 progap.html（%d 字节）", len(html))
+		slog.Info("已保存程序题页面", "file", config.FileDumpProgap, "字节", len(html))
 	}
 
 	p, err := progapProbe(ctx)
 	if err != nil {
 		return err
 	}
-	log.Printf("[结构] 编辑器=%v 可见输入框=%d 疑似空格数=%d 按钮=%v", p.Editors, p.Inputs, p.Blanks, p.Buttons)
-	log.Printf("[结构] 正文前 1500 字:\n%s", truncate(p.Body, 1500))
+	slog.Info("[结构] 页面探测",
+		"编辑器", p.Editors, "可见输入框", p.Inputs, "疑似空格数", p.Blanks, "按钮", p.Buttons)
+	slog.Info("[结构] 正文摘要", "text", truncate(p.Body, 1500))
 	return nil
 }
 
+// truncate 按字符（rune）截断，避免把多字节字符切一半产生乱码。
+// 出参 n 的单位是"字符数"而非字节数。
 func truncate(s string, n int) string {
-	if len(s) <= n {
+	r := []rune(s)
+	if len(r) <= n {
 		return s
 	}
-	return s[:n] + "..."
+	return string(r[:n]) + "..."
 }
 
 // ===================== 作答 =====================
 
 // progapQuestionJS 提取程序题题干（基于真实 DOM）：
-// 标题 + #cgsoucecode 代码区，把嵌在代码块之间的 textarea 替换成"【空N】"占位符后取文本。
+// 标题 + 代码区，把嵌在代码块之间的 textarea 替换成"【空N】"占位符后取文本。
 // 这样 AI 能看到完整上下文：上方代码 → 空 → 下方代码。
+//
+// 注意：这里选择**所有** textarea（而非仅 name^=answer），因为要把每一个空都
+// 换成占位符；填入答案时才按 name 前缀精确定位，见 progapFillAnswersJS。
 const progapQuestionJS = `(function(){
-  var root = document.getElementById('cgsoucecode') || document.querySelector('form[name="uploadFORM"]') || document.body;
+  var root = document.getElementById('` + config.SelProgapCodeArea + `') || document.querySelector('` + config.SelProgapForm + `') || document.body;
   var title = '';
   var h = document.querySelector('h1,h2,h3,h4,h5,h6');
   if (h) title = (h.innerText || '').trim();
@@ -260,7 +272,7 @@ const progapQuestionJS = `(function(){
 func progapFillAnswersJS(answers []string) string {
 	ansBytes, _ := json.Marshal(answers)
 	return fmt.Sprintf(`(function(){
-  var tas = Array.from(document.querySelectorAll('textarea[name^="answer"]'));
+  var tas = Array.from(document.querySelectorAll('`+config.SelProgapAnswer+`'));
   var answers = %s;
   if (tas.length !== answers.length) return 'count-mismatch:' + tas.length;
   var set = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
@@ -276,12 +288,12 @@ func progapFillAnswersJS(answers []string) string {
 
 // progapResultJS 读取提交结果 iframe（showmessageFRAME）的文本
 const progapResultJS = `(function(){
-  var f = document.querySelector('iframe[name="showmessageFRAME"]');
+  var f = document.querySelector('` + config.SelProgapResultFrame + `');
   if (!f || !f.contentDocument || !f.contentDocument.body) return '';
   return (f.contentDocument.body.innerText || '').trim().slice(0, 1000);
 })()`
 
-// progapSolve 逐题作答：进入题目 → 探测结构 → AI 生成 → 填入 → 提交 → 回列表校验状态
+// progapSolve 逐题作答：进入题目 → 探测结构 → AI 生成 → 填入 → 提交 → 回读结果（不通过则重答）
 func progapSolve(ctx context.Context, num int) (int, error) {
 	items, err := progapEnumerate(ctx)
 	if err != nil {
@@ -296,7 +308,7 @@ func progapSolve(ctx context.Context, num int) (int, error) {
 			todo++
 		}
 	}
-	log.Printf("程序片段编程题共 %d 道，其中 %d 道未提交，本次最多做 %d 道", len(items), todo, num)
+	slog.Info("程序片段编程题枚举完成", "总数", len(items), "未提交", todo, "本次最多做", num)
 
 	done, failed := 0, 0
 	for _, it := range items {
@@ -309,42 +321,104 @@ func progapSolve(ctx context.Context, num int) (int, error) {
 		done++
 		fmt.Printf("[%d] %s 解答中...\n", done, it.Title)
 
-		if err := progapAnswerOne(ctx, it, done == 1); err != nil {
-			log.Printf("题 %q 失败: %v", it.Title, err)
+		passed, err := progapAnswerOne(ctx, it, done == 1)
+		if err != nil {
+			slog.Error("题目处理失败", "标题", it.Title, "err", err)
 			failed++
-			// 回到列表页，继续下一题
-			backCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-			_ = safeRun(backCtx, chromedp.Navigate(listURL))
-			cancel()
-			continue
+		} else if !passed {
+			slog.Warn("判题未通过（已用完重答次数）", "标题", it.Title)
+			failed++
+		} else {
+			slog.Info("题目已通过 ✓", "标题", it.Title)
 		}
-		log.Printf("题 %q 已提交 ✓", it.Title)
 
-		backCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		// 回到列表页，继续下一题
+		backCtx, cancel := context.WithTimeout(ctx, config.TimeoutProgapBack)
 		_ = safeRun(backCtx, chromedp.Navigate(listURL))
 		cancel()
-		time.Sleep(2 * time.Second)
+		time.Sleep(config.WaitProgapBackToList)
 	}
-	log.Printf("完成：提交 %d 道，失败 %d 道", done-failed, failed)
+	slog.Info("完成", "通过", done-failed, "未通过或失败", failed)
 	return done - failed, nil
 }
 
-// progapAnswerOne 处理单道程序题（按真实 DOM：textarea 嵌在代码块之间，逐空作答）
-func progapAnswerOne(ctx context.Context, it progapItem, dumpFirst bool) error {
-	oneCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+// progapOutcome 是一次作答的判题结果
+type progapOutcome struct {
+	// Passed 是否通过
+	Passed bool
+	// Known 判题回显里是否能识别出通过/失败；
+	// 为 false 表示文案不认识，此时不触发重答（宁可当通过，避免无谓消耗 token）
+	Known bool
+	// Raw 判题回显原文，用于日志与排查
+	Raw string
+}
+
+// judgeProgapResult 从判题回显文本判断是否通过。
+//
+// 站点回显文案没有稳定契约，所以采用关键词集合匹配，并且**失败关键词优先**——
+// 因为"未通过"这类文本同时含有"通过"二字，先判失败才不会误判。
+func judgeProgapResult(text string) progapOutcome {
+	out := progapOutcome{Raw: text, Passed: true}
+	if strings.TrimSpace(text) == "" {
+		// 没拿到任何回显：无法判断，按"已提交"处理
+		return out
+	}
+	if progapFailRe.MatchString(text) {
+		out.Passed = false
+		out.Known = true
+		return out
+	}
+	if progapPassRe.MatchString(text) {
+		out.Passed = true
+		out.Known = true
+		return out
+	}
+	return out // Known=false
+}
+
+// progapAnswerOne 处理单道程序题，含"判题不通过则重答"的闭环。
+//
+// 每轮重答都重新 Navigate 到题目页——程序题是独立页面，重新进入即可重新作答，
+// 这与选择题"提交后锁定"的形态不同，所以这里能实现真正的重做。
+func progapAnswerOne(ctx context.Context, it progapItem, dumpFirst bool) (bool, error) {
+	var last progapOutcome
+	for try := 1; try <= config.C.MaxAnswerTry; try++ {
+		outcome, err := progapAttempt(ctx, it, dumpFirst && try == 1, try)
+		if err != nil {
+			return false, err
+		}
+		last = outcome
+
+		if outcome.Passed || !outcome.Known {
+			return outcome.Passed, nil
+		}
+		if try >= config.C.MaxAnswerTry {
+			break
+		}
+		slog.Warn("判题未通过，准备重答",
+			"标题", it.Title, "第几次", try, "上限", config.C.MaxAnswerTry, "回显", truncate(outcome.Raw, 120))
+	}
+	return last.Passed, nil
+}
+
+// progapAttempt 完成一次完整作答：打开题目 → 提取题干 → 生成答案 → 填入 → 提交 → 回读结果。
+// try > 1 时给 AI 追加"重答提醒"，让它换个思路。
+func progapAttempt(ctx context.Context, it progapItem, dumpFirst bool, try int) (progapOutcome, error) {
+	oneCtx, cancel := context.WithTimeout(ctx, config.TimeoutProgapQuestion)
 	defer cancel()
 
 	if err := safeRun(oneCtx, chromedp.Navigate(it.Href)); err != nil {
-		return fmt.Errorf("打开题目失败: %w", err)
+		return progapOutcome{}, fmt.Errorf("打开题目失败: %w", err)
 	}
 	// 等渲染（textarea 出现才算就绪）
-	for i := 0; i < 15; i++ {
+	for i := 0; i < config.PollProgapRenderMax; i++ {
 		var n int
-		_ = safeRun(oneCtx, chromedp.Evaluate(`document.querySelectorAll('textarea[name^="answer"]').length`, &n))
+		_ = safeRun(oneCtx, chromedp.Evaluate(
+			fmt.Sprintf(`document.querySelectorAll(%q).length`, config.SelProgapAnswer), &n))
 		if n > 0 {
 			break
 		}
-		time.Sleep(2 * time.Second)
+		time.Sleep(config.PollRenderTick)
 	}
 
 	// 提取题干：标题 + 代码区（textarea 替换为【空N】占位符）
@@ -355,67 +429,88 @@ func progapAnswerOne(ctx context.Context, it progapItem, dumpFirst bool) error {
 		Blanks int    `json:"blanks"`
 	}
 	if err := safeRun(oneCtx, chromedp.Evaluate(progapQuestionJS, &qraw)); err != nil {
-		return fmt.Errorf("提取题干失败: %w", err)
+		return progapOutcome{}, fmt.Errorf("提取题干失败: %w", err)
 	}
 	if err := json.Unmarshal([]byte(qraw), &q); err != nil {
-		return fmt.Errorf("解析题干失败: %w", err)
+		return progapOutcome{}, fmt.Errorf("解析题干失败: %w", err)
 	}
 	if q.Blanks == 0 {
 		// 兜底：题目结构不是"代码内嵌 textarea"（可能是整段编程题），走通用分支
-		log.Printf("  未发现填空 textarea，走通用编辑器分支")
-		return progapAnswerOneGeneric(oneCtx)
+		slog.Warn("未发现填空 textarea，走通用编辑器分支")
+		return progapOutcome{Passed: true}, progapAnswerOneGeneric(oneCtx)
 	}
-	log.Printf("  题干: %s（%d 个空）", q.Title, q.Blanks)
+	slog.Info("开始作答", "标题", q.Title, "空数", q.Blanks, "第几次", try)
 
 	// 第一题自动保存页面 + 打印题干，便于核对
 	if dumpFirst {
 		var html string
 		_ = safeRun(oneCtx, chromedp.Evaluate(`document.documentElement.outerHTML`, &html))
-		_ = os.WriteFile("progap.html", []byte(html), 0644)
-		log.Printf("  已保存第一道程序题页面到 progap.html（%d 字节）", len(html))
-		log.Printf("  题干前 600 字: %s", truncate(q.Text, 600))
+		_ = os.WriteFile(config.FileDumpProgap, []byte(html), 0644)
+		slog.Info("已保存首题页面", "file", config.FileDumpProgap, "字节", len(html))
+		slog.Info("题干摘要", "text", truncate(q.Text, 600))
 	}
 
-	// AI 逐空生成答案
+	// AI 逐空生成答案（重答时带提醒，让模型换个思路）
 	question := q.Title + "\n" + q.Text
-	answers, err := aiProgapBlanks(question, q.Blanks)
+	hint := ""
+	if try > 1 {
+		hint = ai.Prompts.ReanswerSuffix
+	}
+	answers, err := ai.AnswerBlanks(question, q.Blanks, hint)
 	if err != nil {
-		return err
+		return progapOutcome{}, err
 	}
 
 	// 填入 textarea
 	var resp string
 	if err := safeRun(oneCtx, chromedp.Evaluate(progapFillAnswersJS(answers), &resp)); err != nil || resp != "ok" {
-		return fmt.Errorf("填入答案失败: %v %s", err, resp)
+		return progapOutcome{}, fmt.Errorf("填入答案失败: %v %s", err, resp)
 	}
-	log.Printf("  已填入 %d 个空", len(answers))
+	slog.Info("已填入答案", "空数", len(answers))
 
-	// 提交（#cgSubmitBtn，提交到隐藏 iframe，页面不刷新）
-	return progapSubmitAndWait(oneCtx)
+	// 提交（#cgSubmitBtn，提交到隐藏 iframe，页面不刷新）并回读判题结果
+	raw, err := progapSubmitAndWait(oneCtx)
+	if err != nil {
+		return progapOutcome{}, err
+	}
+	return judgeProgapResult(raw), nil
 }
 
-// progapSubmitAndWait 点 #cgSubmitBtn 提交，轮询结果 iframe 等判题结果
-func progapSubmitAndWait(ctx context.Context) error {
-	clickCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	err := safeRun(clickCtx, chromedp.Click(`#cgSubmitBtn`, chromedp.ByQuery, chromedp.NodeVisible))
+// progapSubmitAndWait 点 #cgSubmitBtn 提交，轮询结果 iframe 等判题结果。
+// 返回判题回显原文（可能为空串，表示未等到）。
+func progapSubmitAndWait(ctx context.Context) (string, error) {
+	clickCtx, cancel := context.WithTimeout(ctx, config.TimeoutProgapSubmit)
+	err := safeRun(clickCtx, chromedp.Click(config.SelProgapSubmitBtn, chromedp.ByQuery, chromedp.NodeVisible))
 	cancel()
 	if err != nil {
-		return fmt.Errorf("点击提交按钮失败: %w", err)
+		return "", fmt.Errorf("点击提交按钮失败: %w", err)
 	}
-	log.Printf("  已提交，等待判题结果...")
+	slog.Info("已提交，等待判题结果...")
 
 	// 判题是服务器跑测试用例，可能几秒到几十秒
-	for i := 0; i < 30; i++ {
-		time.Sleep(2 * time.Second)
+	last := ""
+	for i := 0; i < config.PollProgapJudgeMax; i++ {
+		time.Sleep(config.PollProgapJudgeTick)
 		var result string
 		_ = safeRun(ctx, chromedp.Evaluate(progapResultJS, &result))
-		if result != "" && !strings.Contains(result, "正在") && !strings.Contains(result, "处理中") && !strings.Contains(result, "Loading") {
-			log.Printf("  判题结果: %s", truncate(result, 300))
-			return nil
+		if result == "" {
+			continue
 		}
+		last = result
+		if strings.Contains(result, config.TextJudging) ||
+			strings.Contains(result, config.TextJudging2) ||
+			strings.Contains(result, config.TextJudging3) {
+			continue // 还在判题
+		}
+		slog.Info("判题结果", "text", truncate(result, 300))
+		return result, nil
 	}
-	log.Printf("  未等到判题结果（可能服务器较慢），按已提交处理")
-	return nil
+	if last != "" {
+		slog.Warn("未等到明确判题结果，采用最后一次回显", "text", truncate(last, 300))
+		return last, nil
+	}
+	slog.Warn("未等到判题结果（可能服务器较慢），按已提交处理")
+	return "", nil
 }
 
 // progapAnswerOneGeneric 通用兜底分支：整段代码编辑器或逐空 input（结构未知的题目）
@@ -424,7 +519,7 @@ func progapAnswerOneGeneric(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	log.Printf("  结构: 编辑器=%v 输入框=%d 空格=%d 按钮=%v", p.Editors, p.Inputs, p.Blanks, p.Buttons)
+	slog.Info("[兜底] 页面结构", "编辑器", p.Editors, "输入框", p.Inputs, "空格", p.Blanks, "按钮", p.Buttons)
 	if p.Body == "" {
 		return fmt.Errorf("页面正文为空，可能未正确加载")
 	}
@@ -437,7 +532,7 @@ func progapAnswerOneGeneric(ctx context.Context) error {
 	}
 
 	if isEditor && p.Inputs == 0 {
-		code, err := aiProgapCode(p.Body)
+		code, err := ai.AnswerCode(p.Body)
 		if err != nil {
 			return err
 		}
@@ -445,7 +540,7 @@ func progapAnswerOneGeneric(ctx context.Context) error {
 			return err
 		}
 	} else if p.Inputs > 0 {
-		answers, err := aiProgapBlanks(p.Body, p.Inputs)
+		answers, err := ai.AnswerBlanks(p.Body, p.Inputs)
 		if err != nil {
 			return err
 		}
@@ -453,7 +548,7 @@ func progapAnswerOneGeneric(ctx context.Context) error {
 			return err
 		}
 	} else {
-		return fmt.Errorf("未识别到任何输入控件（编辑器=%v），已保存 progap.html 供排查", p.Editors)
+		return fmt.Errorf("未识别到任何输入控件（编辑器=%v），已保存页面供排查", p.Editors)
 	}
 	return progapSubmit(ctx)
 }
@@ -489,7 +584,7 @@ func progapFillEditor(ctx context.Context, code string) error {
 	if resp == "no-editor" {
 		return fmt.Errorf("页面上没有找到可写入的编辑器")
 	}
-	log.Printf("  代码已写入编辑器（%s，%d 字符）", resp, len(code))
+	slog.Info("代码已写入编辑器", "方式", resp, "字符数", len(code))
 	return nil
 }
 
@@ -518,7 +613,7 @@ func progapFillInputs(ctx context.Context, answers []string) error {
 	if resp != "ok" {
 		return fmt.Errorf("填入答案失败: %s", resp)
 	}
-	log.Printf("  已填入 %d 个空", len(answers))
+	slog.Info("已填入答案", "空数", len(answers))
 	return nil
 }
 
@@ -532,12 +627,12 @@ func progapSubmit(ctx context.Context) error {
 		`//input[@type="submit"]`,
 		`//button[contains(., "保存")]`,
 	} {
-		clickCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		clickCtx, cancel := context.WithTimeout(ctx, config.TimeoutSingleAction)
 		err := safeRun(clickCtx, chromedp.Click(sel, chromedp.BySearch, chromedp.NodeVisible))
 		cancel()
 		if err == nil {
 			clicked = true
-			log.Printf("  已点击提交按钮（%s）", sel)
+			slog.Info("已点击提交按钮", "selector", sel)
 			break
 		}
 	}
@@ -546,76 +641,20 @@ func progapSubmit(ctx context.Context) error {
 	}
 
 	// 弹出确认框：点"确定"
-	time.Sleep(1500 * time.Millisecond)
+	time.Sleep(config.WaitConfirmDialog)
 	for _, sel := range []string{
 		`//button[contains(., "确定")]`,
 		`//button[contains(., "确认")]`,
 		`//a[contains(., "确定")]`,
 	} {
-		okCtx, cancel := context.WithTimeout(ctx, 6*time.Second)
+		okCtx, cancel := context.WithTimeout(ctx, config.TimeoutProgapConfirm)
 		err := safeRun(okCtx, chromedp.Click(sel, chromedp.BySearch, chromedp.NodeVisible))
 		cancel()
 		if err == nil {
-			log.Printf("  已点击确认按钮（%s）", sel)
+			slog.Info("已点击确认按钮", "selector", sel)
 			break
 		}
 	}
-	time.Sleep(3 * time.Second)
+	time.Sleep(config.WaitAfterSubmit)
 	return nil
-}
-
-// ===================== AI 调用 =====================
-
-// aiProgapCode 整段程序填空题：返回补全后的完整代码
-func aiProgapCode(body string) (string, error) {
-	sys := `你是C语言程序填空题的答题机器。用户会给出题目正文（含题目描述和待填空的代码片段，空白处用 ____ 或连续下划线标记）。
-要求：
-1. 只输出补全后的完整C语言代码，保持原有代码结构与缩进不变，仅把空白处填上。
-2. 严禁输出 Markdown 代码围栏、解释、题号或任何多余文字。
-3. 代码必须能直接编译通过（包含必要头文件由题目决定，不要擅自增删结构）。`
-	msgs := []*schema.Message{
-		schema.SystemMessage(sys),
-		{Role: schema.User, Content: truncate(body, 6000)},
-	}
-	res, err := ai.ChatModel.Generate(context.Background(), msgs)
-	if err != nil {
-		return "", fmt.Errorf("AI 生成代码失败: %w", err)
-	}
-	if res == nil || len(res.Content) == 0 {
-		return "", fmt.Errorf("AI 返回内容为空")
-	}
-	code := ai.CleanCode(res.Content)
-	if code == "" {
-		return "", fmt.Errorf("AI 返回代码为空")
-	}
-	return code, nil
-}
-
-// aiProgapBlanks 逐空填空：返回 n 行，第 i 行是第 i 个空的答案
-func aiProgapBlanks(body string, n int) ([]string, error) {
-	sys := fmt.Sprintf(`你是C语言程序填空题的答题机器。题目正文里有 %d 个待填的空（对应 %d 个输入框）。
-请输出恰好 %d 行：第 i 行是第 i 个空要填的内容（只填该空本身的代码/表达式/数值，不要整段代码）。
-严禁输出编号、解释、引号或多余内容。`, n, n, n)
-	msgs := []*schema.Message{
-		schema.SystemMessage(sys),
-		{Role: schema.User, Content: truncate(body, 6000)},
-	}
-	res, err := ai.ChatModel.Generate(context.Background(), msgs)
-	if err != nil {
-		return nil, fmt.Errorf("AI 生成填空失败: %w", err)
-	}
-	if res == nil || len(res.Content) == 0 {
-		return nil, fmt.Errorf("AI 返回内容为空")
-	}
-	var lines []string
-	for _, ln := range strings.Split(ai.CleanCode(res.Content), "\n") {
-		ln = strings.TrimSpace(ln)
-		if ln != "" {
-			lines = append(lines, ln)
-		}
-	}
-	if len(lines) != n {
-		return nil, fmt.Errorf("AI 输出 %d 行，期望 %d 行: %q", len(lines), n, lines)
-	}
-	return lines, nil
 }

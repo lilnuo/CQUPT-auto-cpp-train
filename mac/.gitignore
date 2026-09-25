@@ -7,12 +7,23 @@
 
 # 调试产物
 page.html
+progap.html
 captcha.png
 login.png
+
+# 自定义 Prompt（属于个人调参，勿提交；模板见 prompts.example.json）
+prompts.json
+
+# 答错题目记录（个人复盘数据）
+wrong_answers.md
 
 # 本地工作数据
 .workbuddy/
 .vscode/
+.idea/
 
-# 程序题调试产物
-progap.html
+# 编译产物
+*.exe
+*.dll
+/cqupt
+/cqupt-*

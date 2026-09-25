@@ -10,11 +10,23 @@ page.html
 progap.html
 captcha.png
 login.png
-*.exe
-*.dll
+
+# 自定义 Prompt（属于个人调参，勿提交；模板见 prompts.example.json）
+prompts.json
+
+# 答错题目记录（个人复盘数据）
+wrong_answers.md
 
 # 编辑器 / IDE 缓存
 .workbuddy/
 .vscode/
 .idea/
 .codeartsdoer/
+
+# 编译产物
+*.exe
+*.dll
+/cqupt
+/cqupt-*
+mac/cqupt
+windows/cqupt
