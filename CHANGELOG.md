@@ -9,6 +9,71 @@
 
 ---
 
+## v1.3.0（2026-09-25）
+
+**服务化版本**。命令行用法与 v1.2.0 **完全一致**（`go run .` / `go run . -mode=progap` 行为不变），新增一条 HTTP 服务入口；另外修掉两个「**静默的错误答案**」类问题——它们都不报错，但结果是错的。
+
+### 新增：服务模式（`server/`）
+
+一次刷题要独占一个 Chrome、一个 profile、一个调试端口，所以一台机器上并发不了。要让多个人提交任务，只能排队。
+
+- **入口**：`go run ./server`。CLI 与服务**共用 `config` / `ai` / `train` 三层**，只有入口不同。
+- **队列**：直接用 MySQL 表兼队列（`tasks` 表 + `SELECT ... FOR UPDATE SKIP LOCKED`）。任务与排队状态在同一行、同一事务，天然没有「入队成功但业务回滚」的双写不一致；不需要额外引入 Redis / Kafka。
+- **接口**：`POST /api/tasks` 提交（返回 `202 Accepted`）、`GET /api/tasks/{id}` 查状态、`GET /api/tasks/{id}/results` 查逐题结果、`DELETE /api/tasks/{id}` 取消、`GET /` 进度页、`GET /healthz` 健康检查。
+- **进度可观测**：任务执行期间会落库逐条事件（登录成功 / 进入答题页 / 每题完成），进度页与 JSON 接口共用同一套视图转换。
+- **可靠性六件套**：`available_at` 重试退避 · 续租心跳（`LOCK_TIMEOUT/3`，下限 10s）· 锁丢失即中止 · `RecoverStale` 回收僵死任务 · `FailExhausted` 截断死循环 · 优雅退出排空（收到停止信号只停止领新任务，手上的跑完）。
+- **密码保护**：AES-256-GCM 认证加密后存 `password_enc`，明文只在一次函数调用内存在；`TASK_SECRET` 必填且不少于 32 字符，**不提供「先存明文」的降级路径**。
+- 部署与运维细节见 [`mac/server/README.md`](./mac/server/README.md)（Windows 见 [`windows/server/README.md`](./windows/server/README.md)）。
+
+### 结构调整：刷题流程抽成 `train` 包
+
+- Go **不允许别的包导入 `package main`**，服务端要复用刷题流程，流程就必须先离开 `main` 包。
+- 现在：`train/api.go`（对外接口 `Run` / `Request` / `Result` / 进度事件 / 哨兵错误）、`train/train.go`（登录 + 过 WAF + 选择填空题）、`train/progap.go`（程序题）、`train/preflight.go`（启动前的占用闸门）。
+- 根 `main.go` 缩到 **176 行**，只剩 CLI 薄壳（解析参数、交互式问答、打印结果）。
+- **「脚本」与「模块」的差别**：脚本把输入读自 stdin、结果打到终端、用退出码表示成败；模块必须把输入、输出、错误三样都变成显式的参数与返回值。这一步是服务化的第一道坎。
+
+### 新增：浏览器连接诊断工具 `tools/cdpdiag`
+
+把建连过程拆成四步逐层报告，并额外加一步「Chrome 进程还活着吗」——因为连接层报错常常只是**结果**，真正的问题是浏览器压根没活下来。加 `-headless` 可以不弹窗口地只查连接层。
+
+### 修复
+
+1. **启动浏览器不再静默接管别人的浏览器。**
+   当 profile 或调试端口已被另一个 Chrome 占着时，新实例会把 URL 交给已有实例后自己退出，永远不会打印自己的 DevTools 地址。旧代码等满 15 秒后**静默退回按端口直连**，于是连上的是那个**已有实例**——而它打开的原生标签页此刻已经暴露在 CDP 之下，瑞数 WAF 绕过的前提（原生标签页全程无 CDP 会话）就此破裂。表现是页面白屏或 39 字节空壳这种**没有报错的失败**。
+   现在：启动前先探测端口监听者与 profile 单实例锁，任意一条成立就**根本不启动 Chrome**，直接报错并说明处置办法；等满超时后重新收集证据再归因。该错误被标注为**不可重试**（服务端不再为一件注定失败的事反复起浏览器）。
+2. **修 `TouchLock` 里一个把健康任务判成「锁丢失」的陷阱。**
+   `RowsAffected` 返回的是**实际改变的行数**，不是匹配的行数。`locked_at` 是 `DATETIME(3)`，同一毫秒内连续两次续租时新旧值完全相等，MySQL 报 0 行——旧代码把它当「锁丢了」，于是 worker 会主动中止一个完全健康的任务，又是一次静默的错误答案。实测（固定会话时间）：
+   ```
+   第 1 次写入 NOW(3)        → Rows matched: 1  Changed: 1
+   第 2 次写入同一个 NOW(3)  → Rows matched: 1  Changed: 0   ★
+   第 3 次换成不同时刻        → Rows matched: 1  Changed: 1
+   ```
+   现在 0 行时会回查一次「锁到底在谁手里」再下结论。（心跳间隔下限 10 秒，正常配置下撞不进同一毫秒，所以线上极难触发；但依赖「间隔够大」是个隐含前提，不如把 0 行当成需要复核的信号。）
+3. **配置文件读不了不再被静默跳过。**
+   服务端启动时依次尝试 `server.env` / `.env.server` / `.env`，旧实现把 `godotenv.Load` 的**任何**错误都当成「换下一个候选试试」。
+   于是只要 `server.env` 格式有问题，它就被整个跳过，用户看到的是「我明明写了 `TASK_SECRET`，程序却说必填」，而日志里一个字都不提文件有问题。
+   最典型的触发方式在 Windows 上：PowerShell 5.1 的 `Out-File -Encoding utf8` 会写进 UTF-8 **BOM**，godotenv 解析首行时直接报
+   `unexpected character "»" in variable name`（已实测确认）。
+   现在区分「文件不存在」（跳过，正常）与「文件存在但读不了」（直接报错，并指出是哪个文件、最可能是什么原因）。
+
+### 测试
+
+- 测试文件从 3 个增至 **6 个，86 个测试函数 / 148 个用例，全部通过**（v1.2.0 为 99 个用例）：
+  - 新增 `server/store_test.go`（36 个）：并发抢任务恰好一次、`EXPLAIN` 校验抢任务确实走 `idx_claim` 且无 filesort、重试退避、锁归属校验、`RecoverStale` 回收、`FailExhausted` 截断、`TouchLock` 丢锁识别、加密往返、配置校验、模板转义、中间件 504 兜底等。
+  - 新增 `train/preflight_test.go`（10 个）：端口空闲 / CDP 端点 / 普通监听者三种形态，死锁不误报、活锁能识别、闸门放行与拦截。
+  - `main_test.go` 的 JS/判题用例迁入 `train/train_test.go` 并扩充。
+- **测试数据库隔离**：DB 测试默认跳过，设 `CQUPT_TEST_DSN` 才跑；每个测试用独有学号前缀，只清自己那几行，不清空整张表。
+- **新增回归用例 `TestTouchLockSurvivesSameMillisecondRenewal`**：用会话级 `SET timestamp` 把 `NOW(3)` 钉死，**确定性地**复现同毫秒续租（回退修复后该用例必失败，已验证）。
+- 验证：`go build ./...` / `go vet ./...` 干净，**148 PASS / 0 FAIL**，macOS / Windows(PE32+) / Linux(ELF) 三平台交叉编译均通过。
+
+### 其它
+
+- `.gitignore` 补充 `server.env` / `.env.server`（含 `TASK_SECRET` 与数据库口令）、`.chrome-profile-*/`（调试工具的 profile）。
+- `config/site.go` 新增 `TimeoutPortProbe`（端口占用探测超时）。
+- README 新增「报错「建立浏览器控制连接失败」怎么办」排查表。
+
+---
+
 ## v1.2.0（2026-09-24）
 
 **工程化重构版本**。功能行为默认不变（`MAX_ANSWER_TRY=1` / `REANSWER_THRESHOLD=-1` 时与 v1.1.1 完全等价），但内部结构大幅整理，并新增「得分闭环」能力。

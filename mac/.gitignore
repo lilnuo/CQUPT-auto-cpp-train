@@ -1,7 +1,11 @@
 # 密钥（AI API Key，勿提交）
 .env
+# 服务端环境文件（含 TASK_SECRET 与数据库口令，绝不能提交）
+server.env
+.env.server
 
 # 浏览器持久化登录态（含 Cookie，勿提交）
+# 主程序用 .chrome-profile；tools/ 下的调试工具各用 .chrome-profile-<名字>
 .chrome-profile/
 .chrome-profile-*/
 
@@ -20,10 +24,12 @@ wrong_answers.md
 # 本地工作数据
 .workbuddy/
 .vscode/
-.idea/
+.DS_Store
+
+# 私人复盘文档（项目总结 / 学习计划，明确不入库）
+docs/
 
 # 编译产物
 *.exe
-*.dll
 /cqupt
 /cqupt-*

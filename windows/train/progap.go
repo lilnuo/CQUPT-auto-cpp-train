@@ -1,12 +1,12 @@
-package main
+package train
 
 // ============================================================================
 // progap.go —— 程序片段编程题（programFillGapList.jsp）答题支持
 //
 // 设计原则：
-//  1. 全部逻辑在本文件内自成一派，不改动 main.go 里已经跑通的整页刷题（quiz）逻辑；
-//     main.go 只在入口加了一个 -mode 开关分支（默认 quiz，行为与之前完全一致）。
-//  2. 复用 main.go 里已有的通用件：launchHumanChrome / ensureLoginPage /
+//  1. 全部逻辑在本文件内自成一派，不改动 train.go 里已经跑通的整页刷题（quiz）逻辑；
+//     模式分流发生在 api.go 的 Run 里（默认 quiz，行为与之前完全一致）。
+//  2. 复用 train.go 里已有的通用件：launchHumanChrome / ensureLoginPage /
 //     autoLogin / enterAssignment（WAF 绕过、OCR 登录、选作业卡），不重复造轮子。
 //  3. 页面结构不确定时先"探测 + dump"，再据此精修选择器；
 //     结构完全对不上时走 progapAnswerOneGeneric 通用兜底分支。
@@ -20,7 +20,6 @@ import (
 	"cqupt/ai"
 	"cqupt/config"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"log/slog"
 	"os"
@@ -30,13 +29,6 @@ import (
 
 	"github.com/chromedp/chromedp"
 )
-
-// modeFlag 运行模式：
-//
-//	quiz  （默认）整页选择填空题，走 main.go 原有逻辑
-//	progap     程序片段编程题，自动作答
-//	progapdump 只进入第一道程序题并把页面存成 progap.html（用于调选择器）
-var modeFlag = flag.String("mode", "quiz", "运行模式：quiz=整页选择填空（默认）；progap=程序片段编程题；progapdump=只 dump 程序题页面")
 
 // 判题回显的关键词匹配器（编译一次，避免每题重复编译）
 var (
@@ -56,11 +48,8 @@ func runProgap(username, password string, num int, dumpOnly bool) (int, error) {
 		_ = chromeCmd.Wait()
 	}()
 
-	allocURL := "http://127.0.0.1:" + config.C.CDPPort
-	if browserWS != "" {
-		allocURL = browserWS
-	}
-	alloctx, cancelAlloc := chromedp.NewRemoteAllocator(context.Background(), allocURL)
+	// browserWS 一定非空：读不到调试地址时 launchHumanChrome 已经报错返回了。
+	alloctx, cancelAlloc := chromedp.NewRemoteAllocator(context.Background(), browserWS)
 	defer cancelAlloc()
 
 	ctx, cancelCtx := chromedp.NewContext(alloctx)
@@ -380,9 +369,37 @@ func judgeProgapResult(text string) progapOutcome {
 //
 // 每轮重答都重新 Navigate 到题目页——程序题是独立页面，重新进入即可重新作答，
 // 这与选择题"提交后锁定"的形态不同，所以这里能实现真正的重做。
-func progapAnswerOne(ctx context.Context, it progapItem, dumpFirst bool) (bool, error) {
+func progapAnswerOne(ctx context.Context, it progapItem, dumpFirst bool) (passed bool, err error) {
 	var last progapOutcome
+	tries := 0
+
+	// 用 defer 保证从任何出口返回都记录一次结果。
+	// 这道题有四个出口（通过 / 回显无法识别 / 次数用尽 / 出错），
+	// 逐个出口写一遍迟早会漏一个 —— 结果表缺一行，统计出来的正确率就是错的。
+	defer func() {
+		if err != nil {
+			return
+		}
+		detail := "判题未通过"
+		switch {
+		case passed:
+			detail = "判题通过"
+		case !last.Known:
+			detail = "判题回显无法识别，按通过处理（不做无谓重答）"
+		}
+		score := 0.0
+		if passed {
+			score = 1
+		}
+		noteResult(QuestionResult{
+			Pid: it.Title, Text: it.Title,
+			Score: score, Tries: tries,
+			Judgment: detail + "；回显：" + truncate(last.Raw, 120),
+		})
+	}()
+
 	for try := 1; try <= config.C.MaxAnswerTry; try++ {
+		tries = try
 		outcome, err := progapAttempt(ctx, it, dumpFirst && try == 1, try)
 		if err != nil {
 			return false, err

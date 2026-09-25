@@ -1,6 +1,6 @@
 # 重庆邮电大学程序设计平台自动刷题脚本（Windows 11 + Chrome 版）
 
-> **版本：v1.2.0（2026-09-24）** ｜ **平台：Windows 11** ｜ 更新日志见根目录 [CHANGELOG.md](../CHANGELOG.md)
+> **版本：v1.3.0（2026-09-25）** ｜ **平台：Windows 11** ｜ 更新日志见根目录 [CHANGELOG.md](../CHANGELOG.md)
 
 > ⚠️ **仅限个人学习交流，严禁用于任何盈利目的**；使用风险自负（详见根目录 [README](../README.md) 的免责声明）。
 > ⭐ 觉得好用的话，欢迎给仓库点个 **Star**。
@@ -64,6 +64,8 @@ go run . -prompts-init
 
 **v1.2.0 新增**：每题提交前后各读一次页面总分，差值即该题得分；没得分可按策略重答（选择/填空题同页重填，程序题重新打开题目页）。次数用尽仍不得分的题记入 `wrong_answers.md`。
 
+**v1.3.0 新增**：可选的**服务模式**（`go run ./server`，MySQL 队列 + 后台 worker + 进度页），命令行用法完全没变；另外启动浏览器前会先检查 profile / 调试端口是否被另一个 Chrome 占着，占着就直接报错，不再"想办法连上"（那条路会连到别人的浏览器，把 WAF 绕过的前提破坏掉，且**不报错**）。详见下方「服务模式」。
+
 ## 三、⚠️ Windows 上的重要注意事项
 
 1. **运行前请先关闭所有已打开的 Chrome 窗口**。Windows 上如果 Chrome 已经在跑，新启动的进程可能把网址丢给已有实例，导致调试端口没开、脚本连不上浏览器。
@@ -79,19 +81,54 @@ go run . -prompts-init
 ## 四、项目结构
 
 ```
-main.go        # 登录 + 过 WAF + 选择/填空题流程 + 得分闭环
-progap.go      # 程序片段编程题流程 + 判题回显解析
-main_test.go   # 单测
+main.go        # CLI 入口（薄壳）：解析参数、交互式问答、打印结果
+train/         # ★ 刷题流程本体（v1.3.0 从 main 包抽出来，服务端复用这一层）
+  api.go       #   对外接口：Run / Request / Result / 进度事件 / 哨兵错误
+  train.go     #   登录 + 过 WAF + 选择/填空题 + 得分闭环
+  progap.go    #   程序片段编程题 + 判题回显解析
+  preflight.go #   启动前的占用闸门（端口 / profile 锁探测）
 config/        # ★ 全部可调项的集中地
   config.go    #   环境变量读取 + 重答策略
   site.go      #   站点选择器/XPath/正则/文案 + 所有超时参数
   env.go       #   平台差异唯一来源（Chrome 路径 / Python 探测 / profile 目录）
 ai/            # 大模型调用 + Prompt 管理（prompts.go）
 ocr/           # ddddocr 验证码识别
-tools/         # 排查用的小工具（aitest / attachtest / logindump / wafprobe）
+server/        # 服务模式（可选）：HTTP + MySQL 队列 + worker + 进度页
+tools/         # 排查用的小工具（cdpdiag / aitest / attachtest / logindump / wafprobe）
 ```
 
 **站点改版了就改 `config/site.go`，其余代码基本不用动。**
+
+`train` 之所以单独成包：Go **不允许导入 `package main`**，服务端要复用刷题流程，
+流程就得先离开 `main` 包。「能跑起来的脚本」和「能被别的代码调用的模块」是两回事。
+
+## 服务模式（可选）
+
+命令行用法没变。这一节是给「让机器排队慢慢刷」准备的——一次刷题要独占一个 Chrome、
+一个 profile、一个调试端口，所以一台机器上并发不了，想让多个人提交任务就得排队。
+
+```powershell
+# 1) 准备数据库（需要本机有 MySQL；建表 + 建只给 DML 权限的应用账号）
+Get-Content server\schema.sql | mysql -uroot -p
+
+# 2) 写服务端配置：用记事本新建 server.env（与 .env 分开，含密钥与数据库口令），写入两行：
+#      TASK_SECRET=至少32个字符的随机串
+#      DB_PASSWORD=你自己的口令
+notepad server.env
+
+# 3) 起服务（默认监听 127.0.0.1:8080）
+go run ./server
+```
+
+> ⚠️ 别用 `Out-File -Encoding utf8` 生成 `server.env`：Windows PowerShell 5.1 会写进
+> UTF-8 **BOM**，godotenv 解析首行时直接报错。v1.3.0 起这种情况会被明确报出来
+> （指出是哪个文件、最可能是什么原因）；旧版会**静默跳过**这个文件，
+> 于是你只会看到一句莫名其妙的「TASK_SECRET 必填」。用记事本或 VS Code（UTF-8 无 BOM）保存。
+
+提交任务用 `POST /api/tasks`，进度页在 `GET /`。完整的接口表、配置项、
+可靠性机制（重试退避 / 续租心跳 / 僵死回收 / 优雅退出）与已知限制见 [`server/README.md`](./server/README.md)。
+
+> ⚠️ 进度页**没有鉴权**，且默认只监听 `127.0.0.1`。要对外暴露必须先加认证。
 
 ## 五、参数一览
 
@@ -121,7 +158,14 @@ tools/         # 排查用的小工具（aitest / attachtest / logindump / wafpr
 ```powershell
 go build ./...     # 编译
 go vet ./...       # 静态检查
-go test ./...      # 单测（99 个用例）
+go test ./...      # 单测（86 个测试函数 / 148 个用例，默认跳过需要数据库的部分）
+```
+
+需要 MySQL 的那部分测试要显式给 DSN 才会跑（不给就自动跳过）：
+
+```powershell
+$env:CQUPT_TEST_DSN = 'cqupt_app:口令@tcp(127.0.0.1:3306)/cqupt_train?parseTime=true&loc=Local&charset=utf8mb4'
+go test ./...
 ```
 
 ## 七、常见问题
@@ -130,7 +174,8 @@ go test ./...      # 单测（99 个用例）
 |------|------------|
 | `未找到 Chrome/Edge 浏览器` | 用 `CHROME_PATH` 指定 chrome.exe |
 | `OCR 执行失败` | `pip install ddddocr` 没装好，或 Python 没加入 PATH；设 `PYTHON_BIN` 指定 |
-| 页面空白 / 一直连不上 | 先关掉所有 Chrome 窗口再跑 |
+| `浏览器调试资源已被占用` | 另一个 Chrome 已占着 profile 或 `CDP_PORT`。退出所有 Chrome（或用任务管理器结束残留的 chrome.exe），或换 `CDP_PORT` / `CHROME_USER_DATA` |
+| 页面空白 / 一直连不上 | 先关掉所有 Chrome 窗口再跑；再用 `go run ./tools/cdpdiag -headless` 看卡在哪一步 |
 | `ai初始化失败` | `.env` 没建或 Key 填错（注意别用 `copy` 出来的模板原名 `.env.example`） |
 | 某题得分 0 | 模型能力问题，可换更强的模型接入点；或调高 `REANSWER_THRESHOLD` 让它多试几次 |
 | 反复重答还是 0 分 | 说明模型确实做不出来，题目会记进 `wrong_answers.md` |

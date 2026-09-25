@@ -4,7 +4,9 @@
 
 一个能**自动登录 + 自动做题 + 回读得分 + 答错重试**的脚本：启动浏览器 → 过 WAF → OCR 识别验证码登录 → 选作业卡 → 逐题 AI 作答 → 自动提交 → 读回分数，没得分就换思路重答。
 
-当前版本：**v1.2.0**（见 [VERSION](./VERSION) / [CHANGELOG.md](./CHANGELOG.md)）
+当前版本：**v1.3.0**（见 [VERSION](./VERSION) / [CHANGELOG.md](./CHANGELOG.md)）
+
+> v1.3.0 新增**可选的服务模式**：命令行用法没变，另提供一条 HTTP 服务入口（MySQL 队列 + 后台 worker + 进度页），适合「多个人提交任务、机器排队慢慢刷」。见下方[服务模式](#服务模式可选v130-新增)。
 
 ---
 
@@ -61,22 +63,28 @@ Windows 步骤完全一致，只是进 `windows` 目录，且命令在 PowerShel
 
 ```
 mac/  (或 windows/)
-├── main.go              # 登录 + 过 WAF + 选择/填空题主流程 + 得分闭环
-├── progap.go            # 程序片段编程题流程 + 判题回显解析
-├── main_test.go         # 根包单测（JS 拼接转义、判题、rune 截断）
+├── main.go              # CLI 入口（薄壳）：解析参数、交互式问答、打印结果
+├── train/               # ★ 刷题流程本体（v1.3.0 从 main 包抽出来）
+│   ├── api.go           #   对外接口：Run / Request / Result / 进度事件 / 哨兵错误
+│   ├── train.go         #   登录 + 过 WAF + 选择/填空题 + 得分闭环
+│   ├── progap.go        #   程序片段编程题 + 判题回显解析
+│   └── preflight.go     #   启动浏览器前的占用闸门（端口 / profile 锁探测）
 ├── config/              # ★ 全部可调项的集中地
 │   ├── config.go        #   环境变量读取 + Config + 重答策略判定
 │   ├── site.go          #   站点 DOM 契约（选择器/XPath/正则/文案）+ 所有超时参数
-│   ├── env.go           #   平台差异唯一来源（Chrome 路径 / Python 探测 / profile 目录）
-│   └── config_test.go
+│   └── env.go           #   平台差异唯一来源（Chrome 路径 / Python 探测 / profile 目录）
 ├── ai/                  # 大模型调用
 │   ├── ai.go            #   统一入口：Answer / AnswerChoice / AnswerMulti / AnswerBlanks / AnswerCode
-│   ├── prompts.go       #   Prompt 集中管理与外部覆盖（prompts.json）
-│   └── ai_test.go
+│   └── prompts.go       #   Prompt 集中管理与外部覆盖（prompts.json）
 ├── ocr/                 # ddddocr 验证码识别（Python 脚本封装）
-├── tools/               # 排查用的小工具（aitest / attachtest / logindump / wafprobe）
+├── server/              # 服务模式（可选）：HTTP + MySQL 队列 + worker + 进度页
+├── tools/               # 排查用的小工具（cdpdiag / aitest / attachtest / logindump / wafprobe）
 └── prompts.example.json # Prompt 模板，由 go run . -prompts-init 生成
 ```
+
+> 各包都带 `_test.go`。`train` 之所以单独成包：Go **不允许导入 `package main`**，
+> 服务端要复用刷题流程，流程就得先离开 `main` 包——「能跑起来的脚本」和
+> 「能被别的代码调用的模块」是两回事。
 
 **改一个东西该去哪里：**
 
@@ -142,26 +150,77 @@ go run .
 
 ---
 
+## 服务模式（可选，v1.3.0 新增）
+
+命令行用法**没有任何变化**。这一节是给「想让机器排队慢慢刷、多个人提交任务」的场景准备的。
+
+为什么需要排队：一次刷题要独占一个 Chrome 进程、一个 profile、一个调试端口，
+所以一台机器上并发不了。硬要并发，请求只会在浏览器那一层排长队——提交的人既看不到进度，
+也不知道自己排在第几位。
+
+```bash
+# 1) 准备数据库（建表 + 建只给 DML 权限的应用账号）
+mysql -uroot -p < server/schema.sql
+
+# 2) 配置服务端环境（与 CLI 的 .env 分开，含密钥与数据库口令）
+cat > server.env <<'EOF'
+TASK_SECRET=至少32个字符的随机串，用 openssl rand -hex 32 生成
+DB_DSN_USER=cqupt_app
+DB_PASSWORD=改成你自己的口令
+EOF
+# 完整变量表见 server/README.md
+
+# 3) 起服务
+go run ./server
+```
+
+| 接口 | 作用 |
+|------|------|
+| `POST /api/tasks` | 提交任务，返回 `202 Accepted` + 任务 id |
+| `GET /api/tasks/{id}` | 查状态与进度 |
+| `GET /api/tasks/{id}/results` | 查逐题结果 |
+| `DELETE /api/tasks/{id}` | 取消（只能取消还没开跑的） |
+| `GET /` | 进度页（人看的） |
+| `GET /healthz` | 健康检查 |
+
+设计取舍、可靠性机制（重试退避 / 续租心跳 / 僵死回收 / 优雅退出排空）、
+密码怎么存、有哪些已知限制，都写在 **[`server/README.md`](./mac/server/README.md)** 里。
+
+> ⚠️ 进度页**没有鉴权**，服务默认只监听 `127.0.0.1`。要对外暴露必须先加认证，
+> 否则任何人都能看到所有学号与错误信息。
+
+---
+
 ## 维护指南（给日后更新的自己 / 协作者）
 
-1. **改核心逻辑时，两个平台都要改**：`mac/` 和 `windows/` 下都有 `main.go` `progap.go` `ai/` `config/` `ocr/`。
-   两处逻辑要保持一致；平台差异**只在** `config/env.go`（Chrome 路径候选、Python 候选、profile 目录）一处，改完记得两边都跑 `go test ./...`。
+1. **改核心逻辑时，两个平台都要改**：`mac/` 和 `windows/` 下都有
+   `main.go` `train/` `ai/` `config/` `ocr/` `server/` `tools/`。
+   两处逻辑要保持一致；平台差异**只在** `config/env.go`（Chrome 路径候选、Python 候选、profile 目录）一处，
+   改完记得两边都跑 `go test ./...`。
 2. **改完记日志**：在 [CHANGELOG.md](./CHANGELOG.md) 加一条，并**升 `VERSION`**（SemVer：新功能升次版本号，修 Bug 升修订号；结构性重构也走次版本号）。
 3. **两个目录的 README 顶部版本号**一并改成新的 vX.Y.Z（保持一致）。
 4. **提交并打 tag**：
    ```bash
    git add -A
-   git commit -m "v1.2.0: 得分闭环 + 配置抽离 + 单测"
-   git tag v1.2.0
+   git commit -m "v1.3.0: 服务模式 + train 包重构 + 占用闸门"
+   git tag v1.3.0
    git push && git push --tags
    ```
-5. **密钥永远不会进仓库**：`.env` 已被 `.gitignore` 排除；只提交 `.env.example`。`prompts.json`（个人调参）与 `wrong_answers.md`（个人复盘）同样已排除。
+5. **密钥永远不会进仓库**：`.env`（AI Key）与 `server.env`（`TASK_SECRET` + 数据库口令）都已被 `.gitignore` 排除；
+   只提交 `mac/.env.example` / `windows/.env.example`。`prompts.json`（个人调参）与 `wrong_answers.md`（个人复盘）同样已排除。
+6. **服务端测试默认跳过**：涉及 MySQL 的用例需要显式给 DSN 才会跑——
+   ```bash
+   CQUPT_TEST_DSN='cqupt_app:口令@tcp(127.0.0.1:3306)/cqupt_train?parseTime=true&loc=Local&charset=utf8mb4' go test ./...
+   ```
 
 ---
 
 ## 常见问题
 
 - **白屏 / 页面为空**：站点瑞数 WAF，脚本采用「原生启动 Chrome 过挑战再接管」的方式绕过，启动后请耐心等约 20 秒，不要去动弹出的浏览器窗口。
+- **报错「建立浏览器控制连接失败」**：先跑 `go run ./tools/cdpdiag -headless`（不弹窗口），它会逐层报告卡在哪一步。
+  最常见的一类成因是 **profile 或调试端口被另一个 Chrome 占着**——程序现在会在启动浏览器之前就把这种情况拦下来并直接报错，
+  提示你退出所有 Chrome，或用 `CDP_PORT` / `CHROME_USER_DATA` 换一组端口与 profile。
 - **验证码识别失败**：脚本自动重试 4 次，仍失败会停下来让你在浏览器里手动登录，登录后自动继续。
 - **Windows 上连不上浏览器**：运行前先**关掉所有 Chrome 窗口**（Windows 已运行的 Chrome 会吞掉网址导致调试端口打不开）。
 - **换更强的模型**：改 `.env` 里的 `ARK_MODEL_ID` 指向别的接入点即可（模型太弱可能得 0 分）。

@@ -38,11 +38,12 @@ type Config struct {
 	MaxAnswerTry      int     // 单题最多作答次数（含首次）
 	PromptsFile       string  // Prompt 覆盖文件路径；为空则不加载
 	LogFormat         string  // 日志格式：text / json
-
-	// ---- 命令行 ----
-	Dump bool   // 进入做题页后 dump 页面结构
-	Mode string // 运行模式：quiz / progap / progapdump
 }
+
+// 说明：早期版本这里还有 Dump 与 Mode 两个字段，由 main 写入。
+// 但全项目没有任何地方读它们——"进入做题页后是否 dump""用哪种模式跑"
+// 早就改成按参数在调用链里传递了。留着只会让人以为改这两个字段有作用，
+// 于是在 v1.3.0 一并删除。
 
 // C 是全局配置，由 Load 在程序启动时初始化。
 // 之所以用包级变量而非依赖注入，是为了不改变既有函数的签名，

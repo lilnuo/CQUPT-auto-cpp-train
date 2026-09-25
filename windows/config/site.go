@@ -117,10 +117,11 @@ const (
 
 const (
 	// ---- 启动与 WAF ----
-	TimeoutChromeWSWait = 15 * time.Second // 等 Chrome 在 stderr 打印 DevTools 地址
-	WaitWAFChallenge    = 20 * time.Second // 等瑞数挑战自行通过（原生标签页无干扰）
-	TimeoutLoginNav     = 45 * time.Second // 导航到登录页并等加载
-	WaitLoginNavRetry   = 10 * time.Second // 登录页没就绪时的重试间隔
+	TimeoutChromeWSWait = 15 * time.Second       // 等 Chrome 在 stderr 打印 DevTools 地址
+	TimeoutPortProbe    = 500 * time.Millisecond // 探测调试端口是否被占用时的等待上限
+	WaitWAFChallenge    = 20 * time.Second       // 等瑞数挑战自行通过（原生标签页无干扰）
+	TimeoutLoginNav     = 45 * time.Second       // 导航到登录页并等加载
+	WaitLoginNavRetry   = 10 * time.Second       // 登录页没就绪时的重试间隔
 	MaxLoginNavRetry    = 3
 
 	// ---- 登录 ----
